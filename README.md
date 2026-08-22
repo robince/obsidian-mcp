@@ -401,45 +401,22 @@ uv run ruff check .    # lint source, tests, and scripts
 ### Local HTTP functional smoke test
 
 The automated suite exercises the storage, authorization, concurrency, HTTP,
-and transaction layers in process. To additionally prove that the installed
-entry point starts and a real authenticated MCP client can call it, use a
-disposable vault in two terminals.
-
-Terminal 1:
+and transaction layers in process. This one-command test additionally starts
+the installed entry point and connects a real authenticated MCP client to it:
 
 ```bash
-export OBSIDIAN_MCP_SMOKE_ROOT="$(mktemp -d)"
-mkdir -p "$OBSIDIAN_MCP_SMOKE_ROOT/vault/AI-Memory" \
-  "$OBSIDIAN_MCP_SMOKE_ROOT/data/locks" \
-  "$OBSIDIAN_MCP_SMOKE_ROOT/data/transactions" \
-  "$OBSIDIAN_MCP_SMOKE_ROOT/data/conflicts"
-
-VAULT_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/vault" \
-TRANSPORT=http HOST=127.0.0.1 PORT=8000 \
-API_KEY=local-smoke-secret WRITE_PATHS=AI-Memory \
-LOCK_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/locks" \
-TRANSACTION_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/transactions" \
-OPERATION_LEDGER_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/operations.sqlite3" \
-CONFLICT_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/conflicts" \
-REQUIRE_WRITE_PRECONDITIONS=true ALLOW_BLIND_OVERWRITE=false \
-uv run obsidian-remote-mcp
+uv run python scripts/run_local_smoke_test.py
 ```
 
-Terminal 2 (first run `echo $OBSIDIAN_MCP_SMOKE_ROOT` in Terminal 1 and
-substitute the printed path below):
-
-```bash
-uv run python scripts/smoke_test_mcp.py \
-  --url http://127.0.0.1:8000/mcp \
-  --api-key local-smoke-secret \
-  --vault-path /tmp/your-printed-smoke-directory/vault
-```
-
-The script lists tools, creates a uniquely named note, reads its revision,
+The runner chooses a free localhost port, creates a disposable vault, starts
+and health-checks the server, invokes `smoke_test_mcp.py`, then stops the
+server and removes the temporary files. The client lists tools, creates a
+uniquely named note, reads its revision,
 updates it using that revision, verifies the bytes on disk, and confirms that
 a write outside `WRITE_PATHS` is denied. A successful run prints JSON with
-`"status": "ok"`. Stop the server with Ctrl-C; the disposable directory can
-then be removed.
+`"status": "ok"`. Pass `--keep` to retain the disposable vault and server log
+for inspection, or use `smoke_test_mcp.py` directly to test an already-running
+local, containerized, or remote server.
 
 ## License
 
