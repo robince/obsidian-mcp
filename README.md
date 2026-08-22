@@ -109,7 +109,7 @@ for the two auth variants in detail.
 # High-impact mutations are absent from the MCP tool list unless enabled.
 # ENABLE_MOVE=true             # move_note_tool
 # ENABLE_FOLDER_RENAME=true    # rename_folder_tool
-# ENABLE_FOLDER_RESTORE=true   # restore_folder_tool (deferred multi-file Phase 2)
+# ENABLE_FOLDER_RESTORE=true   # transactional restore_folder_tool
 # ENABLE_BULK_REPLACE=true     # find_replace_in_vault_tool
 # ENABLE_DELETE=true           # delete_note_tool and delete_folder_tool
 ```
@@ -394,9 +394,52 @@ src/obsidian_mcp/
 ## Development
 
 ```bash
-uv run pytest                  # run tests (330 tests)
-uv run ruff check src/ tests/  # lint
+uv run pytest -q       # complete automated suite
+uv run ruff check .    # lint source, tests, and scripts
 ```
+
+### Local HTTP functional smoke test
+
+The automated suite exercises the storage, authorization, concurrency, HTTP,
+and transaction layers in process. To additionally prove that the installed
+entry point starts and a real authenticated MCP client can call it, use a
+disposable vault in two terminals.
+
+Terminal 1:
+
+```bash
+export OBSIDIAN_MCP_SMOKE_ROOT="$(mktemp -d)"
+mkdir -p "$OBSIDIAN_MCP_SMOKE_ROOT/vault/AI-Memory" \
+  "$OBSIDIAN_MCP_SMOKE_ROOT/data/locks" \
+  "$OBSIDIAN_MCP_SMOKE_ROOT/data/transactions" \
+  "$OBSIDIAN_MCP_SMOKE_ROOT/data/conflicts"
+
+VAULT_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/vault" \
+TRANSPORT=http HOST=127.0.0.1 PORT=8000 \
+API_KEY=local-smoke-secret WRITE_PATHS=AI-Memory \
+LOCK_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/locks" \
+TRANSACTION_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/transactions" \
+OPERATION_LEDGER_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/operations.sqlite3" \
+CONFLICT_PATH="$OBSIDIAN_MCP_SMOKE_ROOT/data/conflicts" \
+REQUIRE_WRITE_PRECONDITIONS=true ALLOW_BLIND_OVERWRITE=false \
+uv run obsidian-remote-mcp
+```
+
+Terminal 2 (first run `echo $OBSIDIAN_MCP_SMOKE_ROOT` in Terminal 1 and
+substitute the printed path below):
+
+```bash
+uv run python scripts/smoke_test_mcp.py \
+  --url http://127.0.0.1:8000/mcp \
+  --api-key local-smoke-secret \
+  --vault-path /tmp/your-printed-smoke-directory/vault
+```
+
+The script lists tools, creates a uniquely named note, reads its revision,
+updates it using that revision, verifies the bytes on disk, and confirms that
+a write outside `WRITE_PATHS` is denied. A successful run prints JSON with
+`"status": "ok"`. Stop the server with Ctrl-C; the disposable directory can
+then be removed.
 
 ## License
 
