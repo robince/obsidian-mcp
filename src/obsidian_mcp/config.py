@@ -32,6 +32,7 @@ class Config:
     deny_write_paths: list[str]
     lock_path: Path
     operation_ledger_path: Path
+    transaction_path: Path
     conflict_path: Path | None
     store_conflict_content: bool
     require_write_preconditions: bool
@@ -60,6 +61,10 @@ class Config:
     enable_folder_restore: bool
     enable_bulk_replace: bool
     enable_delete: bool
+    mutation_max_files: int
+    mutation_max_bytes: int
+    mutation_max_replacements: int
+    mutation_lock_timeout: float
 
     _initialized: bool = False
 
@@ -119,6 +124,14 @@ class Config:
         )
         if self.operation_ledger_path == self.vault_path or self.vault_path in self.operation_ledger_path.parents:
             raise ConfigError("OPERATION_LEDGER_PATH must be outside VAULT_PATH")
+        raw_transactions = os.environ.get("TRANSACTION_PATH", "")
+        self.transaction_path = (
+            Path(raw_transactions).expanduser().resolve()
+            if raw_transactions
+            else self.lock_path.parent / "transactions"
+        )
+        if self.transaction_path == self.vault_path or self.vault_path in self.transaction_path.parents:
+            raise ConfigError("TRANSACTION_PATH must be outside VAULT_PATH")
         raw_conflicts = os.environ.get("CONFLICT_PATH", "")
         self.conflict_path = Path(raw_conflicts).expanduser().resolve() if raw_conflicts else None
         if self.conflict_path and (
@@ -149,6 +162,21 @@ class Config:
             raise ConfigError("Operation retention, reconciliation and debounce settings must be numeric") from exc
         if self.operation_retention_seconds <= 0 or self.index_reconcile_interval <= 0 or self.watcher_debounce_ms < 0 or self.watcher_max_pending_events <= 0:
             raise ConfigError("Operation retention, reconciliation and watcher queue size must be positive; debounce cannot be negative")
+
+        try:
+            self.mutation_max_files = int(os.environ.get("MUTATION_MAX_FILES", "1000"))
+            self.mutation_max_bytes = int(os.environ.get("MUTATION_MAX_BYTES", str(50 * 1024 * 1024)))
+            self.mutation_max_replacements = int(os.environ.get("MUTATION_MAX_REPLACEMENTS", "10000"))
+            self.mutation_lock_timeout = float(os.environ.get("MUTATION_LOCK_TIMEOUT", "10"))
+        except ValueError as exc:
+            raise ConfigError("Mutation limits and lock timeout must be numeric") from exc
+        if (
+            self.mutation_max_files <= 0
+            or self.mutation_max_bytes <= 0
+            or self.mutation_max_replacements <= 0
+            or self.mutation_lock_timeout <= 0
+        ):
+            raise ConfigError("Mutation limits and lock timeout must be positive")
 
         self.allow_permanent_delete = os.environ.get(
             "ALLOW_PERMANENT_DELETE", "false"

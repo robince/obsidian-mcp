@@ -28,6 +28,11 @@ def vault_factory(tmp_path: Path, monkeypatch):
         # Keep the configured lock domain explicit and outside the temporary
         # vault so the fail-closed LOCK_PATH contract is exercised.
         monkeypatch.setenv("LOCK_PATH", str(tmp_path.parent / f"{tmp_path.name}-locks"))
+        # Keep transaction journals isolated per test.  A recovery-required
+        # journal is deliberately durable for operator recovery, so sharing
+        # the parent directory would make one fault-injection test degrade
+        # unrelated health-route tests.
+        monkeypatch.setenv("TRANSACTION_PATH", str(tmp_path.parent / f"{tmp_path.name}-transactions"))
         cfg_mod._config = None
         idx = VaultIndex(tmp_path)
         idx.build()

@@ -14,6 +14,12 @@ class LockTimeoutError(Exception):
     pass
 
 
+# A single stable lock serializes semantic graph scans with cooperating note
+# writers.  The value is only hashed into the lock directory; it is never
+# created in the synced vault.
+SEMANTIC_GRAPH_LOCK = "__semantic_graph__"
+
+
 def _default_lock_path() -> tuple[Path | None, bool]:
     try:
         from ..config import ConfigError, get_config

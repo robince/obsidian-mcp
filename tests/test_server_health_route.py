@@ -53,3 +53,21 @@ async def test_health_requires_no_auth(tmp_path, vault_factory, monkeypatch):
         resp = await client.get("/health")
 
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_health_detects_runtime_recovery_required_journal(tmp_path, vault_factory, monkeypatch):
+    idx = vault_factory({})
+    cfg = server.get_config()
+    journal_dir = cfg.transaction_path / "runtime-fault"
+    journal_dir.mkdir(parents=True)
+    (journal_dir / "journal.json").write_text('{"operation_id":"runtime-fault","status":"recovery_required"}')
+    monkeypatch.setattr(server, "_cfg", cfg)
+    monkeypatch.setattr(server, "_index", idx)
+
+    async with _client() as client:
+        resp = await client.get("/health")
+
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "degraded"
+    assert resp.json()["incomplete_transactions"] == 1

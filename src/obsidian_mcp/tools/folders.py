@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-import re
 import stat
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.semantics import ParserVaultSemantics
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.mutations import (
+    IndexChange,
+    MutationExecutor,
+    MutationPlan,
+    PlanApprovalRequiredError,
+    PlannedInventory,
+    PlannedMove,
+    inventory_for_paths,
+)
 
 
 def _storage() -> VaultStorage:
@@ -28,7 +36,14 @@ def create_folder(path: str) -> dict:
     return {"path": target.relative, "status": "created"}
 
 
-def delete_folder(path: str, trash: bool = True) -> dict:
+def delete_folder(
+    path: str,
+    trash: bool = True,
+    index: VaultIndex | None = None,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     storage = _storage()
     target = storage.resolve_delete(path, permanent=not trash)
     if not storage.exists(target.relative, read=False):
@@ -37,15 +52,28 @@ def delete_folder(path: str, trash: bool = True) -> dict:
         raise ValueError(f"Not a folder: {path!r}")
     storage.authorize_tree(target.relative, permanent=not trash)
     cfg = get_config()
-    lock = acquire_lock(target.relative, lock_path=cfg.lock_path)
-    try:
-        if trash:
-            storage.trash(target.relative)
-        else:
-            storage.delete(target.relative, permanent=True)
-    finally:
-        lock.release()
-    return {"path": target.relative, "status": "deleted", "trash": trash}
+    if not trash:
+        raise ValueError("Permanent folder deletion is disabled until a fully transactional directory purge exists")
+    descendants = storage._tree_paths(target)
+    destination = storage.policy.canonicalize(f".trash/{target.relative.rsplit('/', 1)[-1]}")
+    plan = MutationPlan(
+        operation="delete_folder",
+        moves=(PlannedMove(target, destination, storage.tree_revision(target.relative), destination_is_trash=True),),
+        inventory=inventory_for_paths(storage, (target.relative,)),
+        index_changes=tuple(IndexChange("remove", rel) for rel in descendants if rel.lower().endswith(".md")),
+        metadata=(("semantic_version", "filesystem-v1"), ("trash", "true")),
+    )
+    if plan_only:
+        return {**plan.summary(), "status": "planned", "path": target.relative, "trash": True}
+    if cfg.enable_delete and not approved_digest:
+        raise PlanApprovalRequiredError("run the operation in plan mode and approve its plan_digest")
+    result = MutationExecutor(storage, index=None).execute(plan, operation_id=operation_id, approved_digest=approved_digest)
+    if index is not None:
+        for rel in descendants:
+            if rel.lower().endswith(".md"):
+                index.remove(rel)
+    result.update({"path": target.relative, "status": "deleted", "transaction_status": result.get("status"), "trash": True})
+    return result
 
 
 def list_trash() -> dict:
@@ -62,7 +90,14 @@ def list_trash() -> dict:
     return {"items": items}
 
 
-def restore_folder(trashed_name: str, to_path: str, index: VaultIndex | None = None) -> dict:
+def restore_folder(
+    trashed_name: str,
+    to_path: str,
+    index: VaultIndex | None = None,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     if "/" in trashed_name or "\\" in trashed_name or trashed_name in (".", ".."):
         raise ValueError(f"trashed_name must be a bare name, not a path: {trashed_name!r}")
     storage = _storage()
@@ -70,7 +105,29 @@ def restore_folder(trashed_name: str, to_path: str, index: VaultIndex | None = N
     info = storage.trash_info(trashed_name)
     if not info.is_dir:
         raise FileNotFoundError(f"No trashed folder named {trashed_name!r} in .trash/")
-    restored = storage.restore(trashed_name, destination.relative)
+    if storage.exists(destination.relative, read=False):
+        raise FileExistsError(f"Target already exists: {destination.relative!r}")
+    storage.authorize_restore(trashed_name, destination.relative)
+    source = storage.policy.canonicalize(f".trash/{trashed_name}")
+    trash_prefix = f".trash/{trashed_name}/"
+    restored_notes = tuple(
+        IndexChange("update", f"{destination.relative}/{path[len(trash_prefix):]}")
+        for path, _size, _revision in storage.trash_inventory(trashed_name)
+        if path.startswith(trash_prefix) and path.lower().endswith(".md")
+    )
+    plan = MutationPlan(
+        operation="restore_folder",
+        moves=(PlannedMove(source, destination, storage.trash_tree_revision(trashed_name), source_is_trash=True),),
+        inventory=tuple(PlannedInventory(path, size, revision) for path, size, revision in storage.trash_inventory(trashed_name)),
+        index_changes=restored_notes,
+        metadata=(("semantic_version", "filesystem-v1"), ("trash", "true")),
+    )
+    if plan_only:
+        return {**plan.summary(), "status": "planned", "path": destination.relative}
+    if get_config().enable_folder_restore and not approved_digest:
+        raise PlanApprovalRequiredError("run the operation in plan mode and approve its plan_digest")
+    result = MutationExecutor(storage, index=index).execute(plan, operation_id=operation_id, approved_digest=approved_digest)
+    restored = destination
 
     notes_restored = 0
     if index is not None:
@@ -81,7 +138,8 @@ def restore_folder(trashed_name: str, to_path: str, index: VaultIndex | None = N
             if storage.policy.can_read(rel):
                 index.update(rel)
                 notes_restored += 1
-    return {"path": restored.relative, "status": "restored", "notes_restored": notes_restored}
+    result.update({"path": restored.relative, "status": "restored", "notes_restored": notes_restored})
+    return result
 
 
 def list_folder(path: str = "") -> dict:
@@ -104,81 +162,21 @@ def rename_folder(
     from_path: str,
     to_path: str,
     index: VaultIndex | None = None,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
 ) -> dict:
-    """Move a folder after preauthorizing every note rewritten for links."""
+    """Plan and transactionally rename a folder and its path-based links."""
     storage = _storage()
-    source = storage.resolve_delete(from_path)
-    destination = storage.resolve_write(to_path)
-    from_path, to_path = source.relative, destination.relative
-    if to_path.startswith(from_path + "/"):
-        raise ValueError("Destination cannot be inside the source folder")
-    if not storage.exists(source.relative, read=False):
-        raise FileNotFoundError(f"Folder not found: {from_path!r}")
-    if not stat.S_ISDIR(storage.stat(source.relative, read=False).st_mode):
-        raise ValueError(f"Not a folder: {from_path!r}")
-    if storage.exists(destination.relative, read=False):
-        raise FileExistsError(f"Target already exists: {to_path!r}")
-
-    source_paths = storage.authorize_tree(from_path, destination=to_path)
-    notes_inside = [rel for rel in source_paths if rel.lower().endswith(".md")]
-    from_prefix = from_path.rstrip("/")
-    to_prefix = to_path.rstrip("/")
-    link_re = re.compile(
-        r"\[\[(" + re.escape(from_prefix) + r"/)([^\]|#]*)((?:[|#][^\]]*)?)\]\]",
-        re.IGNORECASE,
-    )
-
-    updated_files: list[str] = []
-    files_to_rewrite: list[tuple[str, str]] = []
-    for candidate in storage.tree_paths(""):
-        rel = candidate.relative
-        if not rel.lower().endswith(".md"):
-            continue
-        try:
-            raw = storage.read_text(rel)
-        except Exception:
-            continue
-        if link_re.search(raw):
-            storage.resolve_write(rel)  # preflight before any mutation
-            files_to_rewrite.append((rel, raw))
-
-    cfg = get_config()
-    locks = []
-    try:
-        for rel, _ in files_to_rewrite:
-            locks.append(acquire_lock(rel, lock_path=cfg.lock_path))
-        locks.append(acquire_lock(from_path, lock_path=cfg.lock_path))
-        for rel, raw in files_to_rewrite:
-            rewritten = link_re.sub(
-                lambda m: f"[[{to_prefix}/{m.group(2)}{m.group(3)}]]", raw
-            )
-            storage.write_text_atomic(rel, rewritten)
-            updated_files.append(rel)
-        storage.move(from_path, to_path)
-    finally:
-        for lock in reversed(locks):
-            lock.release()
-
-    if index is not None:
-        for rel in notes_inside:
-            index.remove(rel)
-        for candidate in storage.tree_paths(to_path):
-            rel = candidate.relative
-            if not rel.lower().endswith(".md"):
-                continue
-            if storage.policy.can_read(rel):
-                index.update(rel)
-        for rel in updated_files:
-            if not rel.startswith(from_prefix + "/"):
-                index.update(rel)
-
-    external_changes = [
-        rel for rel in updated_files
-        if not rel.startswith(from_prefix + "/") and rel != from_prefix
-    ]
-    return {
-        "from": from_path,
-        "to": to_path,
-        "notes_moved": len(notes_inside),
-        "updated_links_in": external_changes,
-    }
+    plan = ParserVaultSemantics(storage, index=index).plan_folder_rename(from_path, to_path)
+    if plan_only:
+        notes = [change.path for change in plan.index_changes if change.action == "update" and change.path.lower().endswith(".md")]
+        return {**plan.summary(), "status": "planned", "notes_moved": len(notes), "revisions": {item.path.relative: item.original_revision for item in plan.writes}}
+    if get_config().enable_folder_rename and not approved_digest:
+        raise PlanApprovalRequiredError("run the operation in plan mode and approve its plan_digest")
+    result = MutationExecutor(storage, index=index).execute(plan, operation_id=operation_id, approved_digest=approved_digest)
+    result["from"] = result["moved"][0]["from"]
+    result["to"] = result["moved"][0]["to"]
+    result["notes_moved"] = sum(1 for change in plan.index_changes if change.action == "remove")
+    result["updated_links_in"] = [path for path in result["rewritten"] if not path.startswith(result["from"] + "/")]
+    return result

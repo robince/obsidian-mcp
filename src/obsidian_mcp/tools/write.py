@@ -8,14 +8,46 @@ import yaml
 from ..config import get_config
 from ..domain.index import VaultIndex
 from ..domain.models import FileRevision, RevisionConflictError
+from ..domain.semantics import ParserVaultSemantics
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import SEMANTIC_GRAPH_LOCK, acquire_lock
+from ..storage.mutations import (
+    IndexChange,
+    MutationExecutor,
+    MutationPlan,
+    PlanApprovalRequiredError,
+    PlannedInventory,
+    PlannedWrite,
+)
 from ..storage.operations import OperationLedger, OperationOutcomeUnknownError
 from ..storage.policy import WritePermissionError as PolicyWritePermissionError
 from ..storage.revisions import enforce_precondition_policy, revision_result, stage_conflict
 from .read import _is_excluded
 
 WritePermissionError = PolicyWritePermissionError
+
+
+class _NoteLockPair:
+    """Graph-then-path lock pair used by all note read/modify/write tools."""
+
+    def __init__(self, graph, path) -> None:
+        self.graph = graph
+        self.path = path
+
+    def release(self) -> None:
+        self.path.release()
+        self.graph.release()
+
+
+def _acquire_note_locks(path: str) -> _NoteLockPair:
+    cfg = get_config()
+    graph = acquire_lock(SEMANTIC_GRAPH_LOCK, lock_path=cfg.lock_path)
+    try:
+        path_lock = acquire_lock(path, lock_path=cfg.lock_path)
+    except Exception:
+        graph.release()
+        raise
+    return _NoteLockPair(graph, path_lock)
 
 
 def _storage() -> VaultStorage:
@@ -52,7 +84,7 @@ def write_note(
     target = storage.resolve_write(path)
     path = target.relative
 
-    lock = acquire_lock(path, lock_path=get_config().lock_path)
+    lock = _acquire_note_locks(path)
     try:
         frontmatter_preserved = False
         existing_revision = None
@@ -107,7 +139,7 @@ def patch_note(
     target = _storage().resolve_write(path)
     path = target.relative
 
-    lock = acquire_lock(path, lock_path=get_config().lock_path)
+    lock = _acquire_note_locks(path)
     try:
         storage = _storage()
         raw, read_revision = storage.read_text_with_revision(path)
@@ -182,11 +214,10 @@ def delete_note(
     expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Delete a note. trash=True moves it to .trash/ in the vault root."""
-    cfg = get_config()
     _require_note_path(path)
     target = _storage().resolve_delete(path, permanent=not trash)
     path = target.relative
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = _acquire_note_locks(path)
     try:
         storage = _storage()
         if not storage.exists(path, read=False):
@@ -227,7 +258,6 @@ def restore_note(
     if "/" in trashed_name or "\\" in trashed_name or trashed_name in (".", ".."):
         raise ValueError(f"trashed_name must be a bare filename, not a path: {trashed_name!r}")
 
-    cfg = get_config()
     if not to_path.lower().endswith(".md"):
         raise ValueError("Note paths must end in .md")
     storage = _storage()
@@ -236,7 +266,7 @@ def restore_note(
     if info.is_dir:
         raise ValueError("The trashed item is a folder, not a note")
 
-    lock = acquire_lock(f".trash/{trashed_name}", lock_path=cfg.lock_path)
+    lock = _acquire_note_locks(f".trash/{trashed_name}")
     try:
         destination = storage.restore(trashed_name, to_path, expected_revision=expected_revision)
         to_path = destination.relative
@@ -264,7 +294,7 @@ def append_to_note(
     _require_note_path(path)
     storage = _storage()
     path = storage.resolve_write(path).relative
-    lock = acquire_lock(path, lock_path=get_config().lock_path)
+    lock = _acquire_note_locks(path)
     try:
         # One descriptor-relative read gives both the exact bytes used to
         # produce the proposal and its authoritative starting revision.
@@ -361,7 +391,7 @@ def patch_frontmatter(
     if not _storage().exists(path, read=True):
         raise FileNotFoundError(f"Note not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=get_config().lock_path)
+    lock = _acquire_note_locks(path)
     try:
         storage = _storage()
         raw, read_revision = storage.read_text_with_revision(path)
@@ -423,7 +453,7 @@ def manage_tags(
     add = list(add or [])
     remove = list(remove or [])
 
-    lock = acquire_lock(path, lock_path=get_config().lock_path)
+    lock = _acquire_note_locks(path)
     try:
         storage = _storage()
         raw, read_revision = storage.read_text_with_revision(path)
@@ -481,78 +511,39 @@ def _apply_frontmatter_updates(raw: str, updates: dict, merge_arrays: bool) -> s
     return _serialize_frontmatter(fm, body)
 
 
-def move_note(from_path: str, to_path: str, index: VaultIndex | None = None) -> dict:
-    cfg = get_config()
-    if not from_path.lower().endswith(".md") or not to_path.lower().endswith(".md"):
-        raise ValueError("Note paths must end in .md")
-    source = _storage().resolve_delete(from_path)
-    destination = _storage().resolve_write(to_path)
-    from_path, to_path = source.relative, destination.relative
+def _require_plan_approval(approved_digest: str | None, digest: str, *, gated: bool) -> None:
+    """Require an explicit dry-run digest for remotely enabled bulk tools.
+
+    Direct helper calls remain backwards compatible for local callers while
+    the MCP registrations (which are feature-gated) always require approval.
+    """
+    if gated and not approved_digest:
+        raise PlanApprovalRequiredError("run the operation in dry-run mode and approve its plan_digest")
+    if approved_digest is not None and approved_digest != digest:
+        raise PlanApprovalRequiredError("approved plan_digest does not match the current plan")
+
+
+def move_note(
+    from_path: str,
+    to_path: str,
+    index: VaultIndex | None = None,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     storage = _storage()
-
-    if not storage.exists(from_path, read=False):
-        raise FileNotFoundError(f"Source note not found: {from_path!r}")
-    if storage.exists(to_path, read=False):
-        raise FileExistsError(f"Target already exists: {to_path!r}")
-
-    from_stem = Path(from_path).stem
-    to_stem = Path(to_path).stem
-
-    # Patterns that refer to the source note in wikilinks
-    # Match [[from_stem]], [[from_path]], [[from_stem|Alias]], [[from_stem#Heading]]
-    _patterns = [
-        re.escape(from_stem),
-        re.escape(from_path.replace("\\", "/")),
-    ]
-    combined = "|".join(_patterns)
-    link_re = re.compile(rf"\[\[({combined})((?:[|#][^\]]*)?)\]\]", re.IGNORECASE)
-
-    updated_files: list[str] = []
-    all_md = [candidate for candidate in storage.list_files() if candidate.relative.lower().endswith(".md")]
-
-    # Collect and lock all files we'll touch
-    locks = []
-    files_to_rewrite: list[tuple[str, str]] = []
-
-    for candidate in all_md:
-        rel = candidate.relative
-        if rel == from_path:
-            continue
-        try:
-            raw = _storage().read_text(rel)
-        except Exception:
-            continue
-        if link_re.search(raw):
-            # Link rewriting is a second mutation. Preflight every affected
-            # path so a restricted move cannot partially mutate the vault
-            # before discovering an out-of-scope note.
-            _check_write_permission(rel)
-            files_to_rewrite.append((rel, raw))
-
-    try:
-        for rel, _ in files_to_rewrite:
-            locks.append(acquire_lock(rel, lock_path=cfg.lock_path))
-        locks.append(acquire_lock(from_path, lock_path=cfg.lock_path))
-
-        # Rewrite links
-        for rel, raw in files_to_rewrite:
-            rewritten = link_re.sub(lambda m: f"[[{to_stem}{m.group(2)}]]", raw)
-            storage.write_text_atomic(rel, rewritten)
-            updated_files.append(rel)
-
-        # Move the file through the same policy gateway.
-        _storage().move(from_path, to_path)
-    finally:
-        for lock in reversed(locks):
-            lock.release()
-
-    if index is not None:
-        index.remove(from_path)
-        index.update(to_path)
-        for rel in updated_files:
-            index.update(rel)
-
-    return {"from": from_path, "to": to_path, "updated_links_in": updated_files}
+    semantics = ParserVaultSemantics(storage, index=index)
+    plan = semantics.plan_move(from_path, to_path)
+    if plan_only:
+        return {**plan.summary(), "status": "planned", "revisions": {item.path.relative: item.original_revision for item in plan.writes}}
+    _require_plan_approval(approved_digest, plan.digest, gated=get_config().enable_move)
+    result = MutationExecutor(storage, index=index).execute(
+        plan, operation_id=operation_id, approved_digest=approved_digest
+    )
+    result["from"] = result["moved"][0]["from"]
+    result["to"] = result["moved"][0]["to"]
+    result["updated_links_in"] = result["rewritten"]
+    return result
 
 
 def _is_writable(rel_path: str) -> bool:
@@ -586,6 +577,8 @@ def find_replace_in_vault(
     folder: str = "",
     dry_run: bool = True,
     index: VaultIndex | None = None,
+    approved_digest: str | None = None,
+    operation_id: str | None = None,
 ) -> dict:
     """Find and replace text across every note in the vault (or a subfolder).
 
@@ -600,6 +593,34 @@ def find_replace_in_vault(
     cfg = get_config()
     storage = _storage()
 
+    if not search:
+        raise ValueError("search must not be empty")
+    if len(search) > 512 or len(replace) > 512:
+        raise ValueError("search and replace are limited to 512 characters")
+    if mode not in {"exact", "regex"}:
+        raise ValueError("mode must be exact or regex")
+    if mode == "regex" and cfg.enable_bulk_replace:
+        # Python's stdlib regex engine has no execution timeout; never expose
+        # it to a remote high-impact mutation caller.
+        raise ValueError("regex bulk replacement is disabled for remote mutations")
+    if cfg.enable_bulk_replace:
+        # A protected/excluded note could contain an unobserved match.  The
+        # enabled remote operation therefore refuses to run until the scope is
+        # fully inspectable instead of silently skipping it.
+        for hidden in storage._tree_paths(storage.policy.canonicalize(folder)):
+            if hidden == ".trash" or hidden.startswith(".trash/"):
+                continue
+            if not hidden.lower().endswith(".md"):
+                continue
+            try:
+                storage.policy.resolve_read(hidden)
+                if any(hidden == rule or hidden.startswith(rule.rstrip("/") + "/") for rule in cfg.exclude_paths):
+                    raise WritePermissionError("bulk replacement cannot inspect an excluded Markdown file")
+            except Exception as exc:
+                raise WritePermissionError(
+                    "bulk replacement cannot inspect a protected Markdown file"
+                ) from exc
+
     if mode == "regex":
         try:
             pattern = re.compile(search)
@@ -608,7 +629,7 @@ def find_replace_in_vault(
     else:
         pattern = re.compile(re.escape(search))
 
-    candidates: list[tuple[str, str, int]] = []
+    candidates: list[tuple[str, str, int, str | None]] = []
     skipped_write_protected: list[str] = []
     for candidate in storage.list_files(folder):
         rel = candidate.relative
@@ -626,48 +647,74 @@ def find_replace_in_vault(
         if not _is_writable(rel):
             skipped_write_protected.append(rel)
             continue
-        candidates.append((rel, raw, count))
+        revision = storage.revision(rel).token
+        candidates.append((rel, raw, count, revision))
+
+    if cfg.enable_bulk_replace and skipped_write_protected:
+        raise WritePermissionError(
+            "bulk replacement would affect write-protected files: "
+            + ", ".join(skipped_write_protected[:20])
+        )
+
+    if sum(item[2] for item in candidates) > cfg.mutation_max_replacements:
+        raise ValueError(f"replacement count exceeds configured limit ({cfg.mutation_max_replacements})")
+
+    writes = tuple(
+        PlannedWrite(
+            path=storage.resolve_write(rel),
+            original_revision=revision,
+            content=pattern.sub(replace, raw).encode("utf-8"),
+        )
+        for rel, raw, _count, revision in candidates
+    )
+    plan = MutationPlan(
+        operation="bulk_replace",
+        writes=writes,
+        inventory=tuple(
+            PlannedInventory(rel, len(raw.encode("utf-8")), revision or "")
+            for rel, raw, _count, revision in candidates
+        ),
+        index_changes=tuple(IndexChange("update", rel) for rel, *_ in candidates),
+        metadata=(
+            ("search", search),
+            ("replace", replace),
+            ("mode", mode),
+            ("folder", storage.resolve_read(folder, allow_empty=True).relative),
+            ("semantic_version", "parser-v1"),
+        ),
+    )
 
     if dry_run:
         return {
             "dry_run": True,
             "matches": [
-                {"path": rel, "match_count": count, "preview": _match_snippets(raw, pattern)}
-                for rel, raw, count in candidates
+                {"path": rel, "match_count": count, "preview": _match_snippets(raw, pattern), "revision": revision}
+                for rel, raw, count, revision in candidates
             ],
-            "total_matches": sum(count for *_, count in candidates),
+            "total_matches": sum(item[2] for item in candidates),
+            "plan_digest": plan.digest,
+            "revisions": {rel: revision for rel, _raw, _count, revision in candidates},
             "skipped_write_protected": skipped_write_protected,
         }
+
+    _require_plan_approval(approved_digest, plan.digest, gated=cfg.enable_bulk_replace)
 
     if not candidates:
         return {
             "dry_run": False,
             "replaced_in": [],
             "total_replacements": 0,
+            "plan_digest": plan.digest,
             "skipped_write_protected": skipped_write_protected,
         }
 
-    locks = []
-    try:
-        for rel, _, _ in candidates:
-            locks.append(acquire_lock(rel, lock_path=cfg.lock_path))
-        replaced_in: list[str] = []
-        total = 0
-        for rel, raw, count in candidates:
-            storage.write_text_atomic(rel, pattern.sub(replace, raw))
-            replaced_in.append(rel)
-            total += count
-    finally:
-        for lock in reversed(locks):
-            lock.release()
-
-    if index is not None:
-        for rel in replaced_in:
-            index.update(rel)
-
-    return {
+    result = MutationExecutor(storage, index=index).execute(
+        plan, operation_id=operation_id, approved_digest=approved_digest
+    )
+    result.update({
         "dry_run": False,
-        "replaced_in": replaced_in,
-        "total_replacements": total,
+        "replaced_in": result["rewritten"],
+        "total_replacements": sum(item[2] for item in candidates),
         "skipped_write_protected": skipped_write_protected,
-    }
+    })
+    return result

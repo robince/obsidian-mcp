@@ -9,8 +9,12 @@ then performed relative to directory file descriptors opened with
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import hashlib
 import os
 import stat
+import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -115,6 +119,8 @@ def _opened_parent(root: Path, relative: str, *, create: bool = False) -> Iterat
                 if not create:
                     raise
                 os.mkdir(component, 0o770, dir_fd=current)
+                # Persist each newly-created parent before descending into it.
+                _fsync_dir(current)
                 child = os.open(component, _dir_flags(), dir_fd=current)
             fds.append(child)
             current = child
@@ -191,7 +197,7 @@ def _revision_at(parent_fd: int, leaf: str) -> FileRevision:
 def _scandir_tree(fd: int, prefix: str = "") -> Iterator[tuple[str, os.stat_result, bool]]:
     """Yield all descendants, rejecting symlinks and using stable dirfds."""
     with os.scandir(fd) as entries:
-        for entry in entries:
+        for entry in sorted(entries, key=lambda item: item.name):
             rel = f"{prefix}/{entry.name}" if prefix else entry.name
             info = entry.stat(follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
@@ -226,6 +232,55 @@ def _remove_tree_fd(parent_fd: int, leaf: str) -> None:
     finally:
         os.close(child_fd)
     os.rmdir(leaf, dir_fd=parent_fd)
+
+
+def _rename_noreplace(src_parent: int, src_leaf: str, dst_parent: int, dst_leaf: str) -> None:
+    """Move one entry without ever replacing a concurrently-created target.
+
+    Linux and macOS expose the required directory-descriptor primitives via
+    libc.  For regular files, the hard-link/unlink fallback is also
+    no-replace safe.  There is no portable equivalent for directories, so a
+    platform without one of the primitives fails closed rather than risking a
+    destructive ``rename`` replacement.
+    """
+    src_name = os.fsencode(src_leaf)
+    dst_name = os.fsencode(dst_leaf)
+    libc = ctypes.CDLL(None, use_errno=True)
+    primitive = None
+    flags = 0
+    if sys.platform.startswith("linux"):
+        primitive = getattr(libc, "renameat2", None)
+        flags = 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        primitive = getattr(libc, "renameatx_np", None)
+        flags = 4  # RENAME_EXCL
+    if primitive is not None:
+        primitive.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        primitive.restype = ctypes.c_int
+        if primitive(src_parent, src_name, dst_parent, dst_name, flags) == 0:
+            _fsync_dir(src_parent)
+            if dst_parent != src_parent:
+                _fsync_dir(dst_parent)
+            return
+        error = ctypes.get_errno()
+        if error not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            raise OSError(error, os.strerror(error), dst_leaf)
+
+    info = _ensure_not_symlink(src_parent, src_leaf)
+    if stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTSUP, "directory no-replace move is unavailable", src_leaf)
+    # Hard-link creation is atomic and fails with EEXIST if another writer
+    # wins the destination race.  It is only a fallback for regular files.
+    os.link(src_leaf, dst_leaf, src_dir_fd=src_parent, dst_dir_fd=dst_parent, follow_symlinks=False)
+    try:
+        os.unlink(src_leaf, dir_fd=src_parent)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(dst_leaf, dir_fd=dst_parent)
+        raise
+    _fsync_dir(src_parent)
+    if dst_parent != src_parent:
+        _fsync_dir(dst_parent)
 
 
 class VaultStorage:
@@ -371,6 +426,25 @@ class VaultStorage:
         """Return the authoritative SHA-256 revision of an authorized file."""
         _, revision = self._read_fd(path)
         return revision
+
+    def tree_revision(self, path: str) -> str:
+        """Return a deterministic digest for a directory's current files."""
+        target = self.policy.resolve_read(path)
+        digest = hashlib.sha256()
+        prefix = target.relative.rstrip("/") + "/" if target.relative else ""
+        for absolute in sorted(self._tree_paths(target)):
+            relative = "." if absolute == target.relative else absolute.removeprefix(prefix)
+            info = self.stat(absolute)
+            if stat.S_ISDIR(info.st_mode):
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0dir\n")
+                continue
+            revision = self.revision(absolute)
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(revision.sha256.encode("ascii"))
+            digest.update(b"\n")
+        return "tree:" + digest.hexdigest()
 
     def read_text_with_revision(self, path: str) -> tuple[str, FileRevision]:
         content, revision = self._read_fd(path)
@@ -525,11 +599,33 @@ class VaultStorage:
             target, content, expected_revision=expected_revision, create_only=create_only
         )
 
+    def remove_file(self, path: str, *, expected_revision: FileRevision | str | dict | None = None) -> VaultPath:
+        """Remove one authorized regular file for transaction rollback.
+
+        This is intentionally not exposed as a user-facing delete operation;
+        it exists so a transaction can restore an originally-absent file even
+        when ``ALLOW_PERMANENT_DELETE`` is disabled for callers.
+        """
+        target = self.resolve_write(path)
+        with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
+            info = _ensure_not_symlink(parent_fd, leaf)
+            if not stat.S_ISREG(info.st_mode):
+                raise IsADirectoryError(target.relative)
+            if expected_revision is not None:
+                actual = _revision_at(parent_fd, leaf)
+                expected = FileRevision.from_value(expected_revision)
+                if actual.sha256 != expected.sha256:
+                    raise RevisionConflictError(target.relative, expected, actual)
+            os.unlink(leaf, dir_fd=parent_fd)
+            _fsync_dir(parent_fd)
+        return target
+
     def make_dir(self, path: str) -> VaultPath:
         target = self.resolve_write(path)
         with _opened_parent(self.policy.root, target.relative, create=True) as (parent_fd, leaf):
             try:
                 os.mkdir(leaf, 0o770, dir_fd=parent_fd)
+                _fsync_dir(parent_fd)
             except FileExistsError:
                 info = _ensure_not_symlink(parent_fd, leaf)
                 if not stat.S_ISDIR(info.st_mode):
@@ -607,9 +703,15 @@ class VaultStorage:
                     pass
                 else:
                     raise FileExistsError(f"Target already exists: {destination.relative!r}")
-                os.rename(src_leaf, dst_leaf, src_dir_fd=src_parent, dst_dir_fd=dst_parent)
+                _rename_noreplace(src_parent, src_leaf, dst_parent, dst_leaf)
 
-    def move(self, from_path: str, to_path: str) -> tuple[VaultPath, VaultPath]:
+    def move(
+        self,
+        from_path: str,
+        to_path: str,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+    ) -> tuple[VaultPath, VaultPath]:
         source = self.resolve_delete(from_path)
         destination = self.resolve_write(to_path)
         if source.relative == destination.relative:
@@ -617,6 +719,17 @@ class VaultStorage:
         if destination.relative.startswith(source.relative + "/"):
             raise VaultPathError("Destination cannot be inside the source tree")
         self.authorize_tree(source.relative, destination=destination.relative)
+        if expected_revision is not None:
+            if isinstance(expected_revision, str) and expected_revision.startswith("tree:"):
+                actual_tree = self.tree_revision(source.relative)
+                if actual_tree != expected_revision:
+                    raise OSError(errno.EAGAIN, f"Tree revision conflict for {source.relative!r}")
+            else:
+                with _opened_parent(self.policy.root, source.relative) as (source_parent, source_leaf):
+                    actual = _revision_at(source_parent, source_leaf)
+                    expected = FileRevision.from_value(expected_revision)
+                    if actual.sha256 != expected.sha256:
+                        raise RevisionConflictError(source.relative, expected, actual)
         self._rename_relative(source, destination)
         return source, destination
 
@@ -647,14 +760,20 @@ class VaultStorage:
         path: str,
         *,
         expected_revision: FileRevision | str | dict | None = None,
+        destination_name: str | None = None,
     ) -> tuple[VaultPath, Path]:
         source = self.resolve_delete(path)
         self.authorize_tree(source.relative)
+        if destination_name is not None and (
+            not destination_name or Path(destination_name).name != destination_name or destination_name in {".", ".."}
+        ):
+            raise VaultPathError("Trash destination must be a bare filename")
         with _opened_dir(self.policy.root, "") as root_fd:
             try:
                 trash_fd = os.open(".trash", _dir_flags(), dir_fd=root_fd)
             except FileNotFoundError:
                 os.mkdir(".trash", 0o700, dir_fd=root_fd)
+                _fsync_dir(root_fd)
                 trash_fd = os.open(".trash", _dir_flags(), dir_fd=root_fd)
             try:
                 if stat.S_ISLNK(_stat_at(root_fd, ".trash").st_mode):
@@ -662,24 +781,68 @@ class VaultStorage:
                 with _opened_parent(self.policy.root, source.relative) as (src_parent, src_leaf):
                     _ensure_not_symlink(src_parent, src_leaf)
                     if expected_revision is not None:
-                        actual = _revision_at(src_parent, src_leaf)
-                        expected = FileRevision.from_value(expected_revision)
-                        if actual.sha256 != expected.sha256:
-                            raise RevisionConflictError(source.relative, expected, actual)
-                    destination_name = source.relative.rsplit("/", 1)[-1]
+                        if isinstance(expected_revision, str) and expected_revision.startswith("tree:"):
+                            actual_tree = self.tree_revision(source.relative)
+                            if actual_tree != expected_revision:
+                                raise OSError(errno.EAGAIN, f"Tree revision conflict for {source.relative!r}")
+                        else:
+                            actual = _revision_at(src_parent, src_leaf)
+                            expected = FileRevision.from_value(expected_revision)
+                            if actual.sha256 != expected.sha256:
+                                raise RevisionConflictError(source.relative, expected, actual)
+                    fixed_destination = destination_name is not None
+                    base_name = destination_name or source.relative.rsplit("/", 1)[-1]
+                    while True:
+                        destination_name = base_name
+                        if not fixed_destination:
+                            try:
+                                _stat_at(trash_fd, destination_name)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                stem, dot, suffix = destination_name.rpartition(".")
+                                if not dot:
+                                    stem, suffix = destination_name, ""
+                                destination_name = f"{stem}-{uuid.uuid4().hex[:8]}{('.' + suffix) if suffix else ''}"
+                        try:
+                            _rename_noreplace(src_parent, src_leaf, trash_fd, destination_name)
+                        except FileExistsError:
+                            if fixed_destination:
+                                raise
+                            # A concurrent trash writer won the collision
+                            # check; choose a fresh collision name and retry
+                            # atomically.
+                            continue
+                        return source, self.policy.root / ".trash" / destination_name
+            finally:
+                os.close(trash_fd)
+
+    def trash_destination_name(self, path: str) -> str:
+        """Choose a currently free bare trash name without mutating the vault.
+
+        Transaction callers persist this exact name in their intent before
+        invoking :meth:`trash`, so a crash after the rename can still identify
+        and verify the attributable destination.  The final operation remains
+        no-replace safe if another writer wins the race.
+        """
+        source = self.resolve_delete(path)
+        base_name = source.relative.rsplit("/", 1)[-1]
+        with _opened_dir(self.policy.root, "") as root_fd:
+            try:
+                trash_fd = os.open(".trash", _dir_flags(), dir_fd=root_fd)
+            except FileNotFoundError:
+                return base_name
+            try:
+                candidate = base_name
+                while True:
                     try:
-                        _stat_at(trash_fd, destination_name)
+                        _stat_at(trash_fd, candidate)
                     except FileNotFoundError:
-                        pass
-                    else:
-                        stem, dot, suffix = destination_name.rpartition(".")
-                        if not dot:
-                            stem, suffix = destination_name, ""
-                        destination_name = f"{stem}-{uuid.uuid4().hex[:8]}{('.' + suffix) if suffix else ''}"
-                    os.rename(src_leaf, destination_name, src_dir_fd=src_parent, dst_dir_fd=trash_fd)
-                    _fsync_dir(src_parent)
-                    _fsync_dir(trash_fd)
-                    return source, self.policy.root / ".trash" / destination_name
+                        return candidate
+                    stem, dot, suffix = candidate.rpartition(".")
+                    if not dot:
+                        stem, suffix = candidate, ""
+                    candidate = f"{stem}-{uuid.uuid4().hex[:8]}{('.' + suffix) if suffix else ''}"
             finally:
                 os.close(trash_fd)
 
@@ -716,6 +879,76 @@ class VaultStorage:
                 mtime=info.st_mtime,
             )
 
+    def trash_tree_revision(self, trashed_name: str) -> str:
+        """Digest a trash item without granting ordinary read access to .trash."""
+        info = self.trash_info(trashed_name)
+        digest = hashlib.sha256()
+        with _opened_dir(self.policy.root, ".trash") as trash_fd:
+            if not info.is_dir:
+                revision = _revision_at(trash_fd, trashed_name)
+                return "trash:" + revision.sha256
+            item_fd = os.open(trashed_name, _dir_flags(), dir_fd=trash_fd)
+            try:
+                digest.update(b".\0dir\n")
+                for relative, _item_info, is_dir in _scandir_tree(item_fd):
+                    if is_dir:
+                        digest.update(relative.encode("utf-8"))
+                        digest.update(b"\0dir\n")
+                        continue
+                    parent = relative.rsplit("/", 1)
+                    if len(parent) == 1:
+                        revision = _revision_at(item_fd, parent[0])
+                    else:
+                        with _opened_parent(self.policy.root, ".trash/" + trashed_name + "/" + relative) as (parent_fd, leaf):
+                            revision = _revision_at(parent_fd, leaf)
+                    digest.update(relative.encode("utf-8"))
+                    digest.update(b"\0")
+                    digest.update(revision.sha256.encode("ascii"))
+                    digest.update(b"\n")
+            finally:
+                os.close(item_fd)
+        return "trash:" + digest.hexdigest()
+
+    def trash_inventory(self, trashed_name: str) -> list[tuple[str, int, str]]:
+        """Return regular-file inventory for a trash item without policy reads."""
+        info = self.trash_info(trashed_name)
+        result: list[tuple[str, int, str]] = []
+        with _opened_dir(self.policy.root, ".trash") as trash_fd:
+            if not info.is_dir:
+                file_info = _stat_at(trash_fd, trashed_name)
+                revision = _revision_at(trash_fd, trashed_name)
+                return [(f".trash/{trashed_name}", file_info.st_size, revision.token)]
+            item_fd = os.open(trashed_name, _dir_flags(), dir_fd=trash_fd)
+            try:
+                for relative, item_info, is_dir in _scandir_tree(item_fd):
+                    if is_dir:
+                        continue
+                    full = f".trash/{trashed_name}/{relative}"
+                    with _opened_parent(self.policy.root, full) as (parent_fd, leaf):
+                        revision = _revision_at(parent_fd, leaf)
+                    result.append((full, item_info.st_size, revision.token))
+            finally:
+                os.close(item_fd)
+        return result
+
+    def authorize_restore(self, trashed_name: str, to_path: str) -> VaultPath:
+        """Preauthorize every destination descendant of a trash directory."""
+        info = self.trash_info(trashed_name)
+        destination = self.resolve_write(to_path)
+        with _opened_dir(self.policy.root, ".trash") as trash_fd:
+            if not info.is_dir:
+                self.policy.resolve_write(destination.relative)
+                return destination
+            source_fd = os.open(info.name, _dir_flags(), dir_fd=trash_fd)
+            try:
+                self.policy.resolve_write(destination.relative)
+                for relative, _item_info, _is_dir in _scandir_tree(source_fd):
+                    mapped = f"{destination.relative}/{relative}"
+                    self.policy.resolve_write(mapped)
+            finally:
+                os.close(source_fd)
+        return destination
+
     def restore(
         self,
         trashed_name: str,
@@ -724,7 +957,13 @@ class VaultStorage:
         expected_revision: FileRevision | str | dict | None = None,
     ) -> VaultPath:
         info = self.trash_info(trashed_name)
-        destination = self.resolve_write(to_path)
+        destination = self.authorize_restore(trashed_name, to_path)
+        if info.is_dir and expected_revision is not None:
+            if not (isinstance(expected_revision, str) and expected_revision.startswith("trash:")):
+                raise ValueError("Directory restore requires a trash tree revision")
+            actual_tree = self.trash_tree_revision(trashed_name)
+            if actual_tree != expected_revision:
+                raise OSError(errno.EAGAIN, f"Trash tree revision conflict for {trashed_name!r}")
         if info.is_dir:
             dest_prefix = destination.relative.rstrip("/") + "/"
             if any(
@@ -734,19 +973,6 @@ class VaultStorage:
                 raise ProtectedPathError(
                     f"Directory restore crosses a protected destination descendant of {destination.relative!r}"
                 )
-        with _opened_dir(self.policy.root, ".trash") as trash_fd:
-            source_fd = os.open(info.name, _dir_flags(), dir_fd=trash_fd) if info.is_dir else -1
-            try:
-                source_paths = [destination.relative]
-                if source_fd >= 0:
-                    source_paths.extend(
-                        f"{destination.relative}/{rel}" for rel, _, _ in _scandir_tree(source_fd)
-                    )
-                for rel in source_paths:
-                    self.policy.resolve_write(rel)
-            finally:
-                if source_fd >= 0:
-                    os.close(source_fd)
         with (
             _opened_dir(self.policy.root, ".trash") as trash_fd,
             _opened_parent(self.policy.root, destination.relative, create=True) as (dst_parent, dst_leaf),
@@ -761,15 +987,17 @@ class VaultStorage:
                     pass
                 else:
                     raise FileExistsError(f"Target already exists: {to_path!r}")
-                os.rename(info.name, dst_leaf, src_dir_fd=trash_fd, dst_dir_fd=dst_parent)
-                _fsync_dir(trash_fd)
-                _fsync_dir(dst_parent)
+                _rename_noreplace(trash_fd, info.name, dst_parent, dst_leaf)
             else:
                 source_revision = _revision_at(trash_fd, info.name)
                 if expected_revision is not None:
-                    expected = FileRevision.from_value(expected_revision)
-                    if source_revision.sha256 != expected.sha256:
-                        raise RevisionConflictError(trashed_name, expected, source_revision)
+                    if isinstance(expected_revision, str) and expected_revision.startswith("trash:"):
+                        if source_revision.sha256 != expected_revision.removeprefix("trash:"):
+                            raise OSError(errno.EAGAIN, f"Trash revision conflict for {trashed_name!r}")
+                    else:
+                        expected = FileRevision.from_value(expected_revision)
+                        if source_revision.sha256 != expected.sha256:
+                            raise RevisionConflictError(trashed_name, expected, source_revision)
                 try:
                     _stat_at(dst_parent, dst_leaf)
                 except FileNotFoundError:

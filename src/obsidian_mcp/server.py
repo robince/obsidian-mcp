@@ -19,6 +19,7 @@ from .config import ConfigError, get_config
 from .domain.index import VaultIndex
 from .domain.models import FileRevision, RevisionConflictError
 from .storage.filesystem import VaultStorage
+from .storage.mutations import MutationError, incomplete_transactions
 from .storage.operations import (
     LedgerUnavailableError,
     OperationConflictError,
@@ -121,7 +122,7 @@ def _mutation_boundary(function):
         try:
             return function(*args, **kwargs)
         except (RevisionConflictError, PreconditionRequiredError, OperationConflictError,
-                OperationOutcomeUnknownError, LedgerUnavailableError) as exc:
+                OperationOutcomeUnknownError, LedgerUnavailableError, MutationError) as exc:
             if isinstance(exc, RevisionConflictError) and _watcher is not None:
                 _watcher.note_conflict()
             return exc.to_dict()
@@ -158,7 +159,8 @@ Always use `search_notes_tool` or `query_notes_tool` before creating notes to av
 - `restore_note_tool(trashed_name, to_path)` — undo a trashed delete; trashed_name from list_trash_tool
 - `move_note_tool(from_path, to_path)` — rename/move + rewrites all wikilinks vault-wide
 - `find_replace_in_vault_tool(search, replace, mode, folder, dry_run)` — bulk find/replace across
-  every note; dry_run=True (default) previews matches before writing anything
+  every note; dry_run=True (default) previews matches before writing anything.
+  Remote commits support literal exact matching only; regex bulk mutation is disabled.
 
 High-impact mutation tools are disabled by default and absent from the tool
 list until explicitly enabled: `ENABLE_DELETE` registers note/folder deletion,
@@ -480,6 +482,7 @@ def _build_auth() -> AuthProvider | None:
 _cfg = None
 _index: VaultIndex | None = None
 _watcher = None
+_incomplete_transactions: list[dict] = []
 
 mcp = FastMCP(name="obsidian-mcp", instructions=_load_instructions(), auth=_build_auth())
 
@@ -659,16 +662,18 @@ def find_replace_in_vault_tool(
     mode: str = "exact",
     folder: str = "",
     dry_run: bool = True,
+    approved_digest: str | None = None,
+    operation_id: str | None = None,
 ) -> dict:
     """Find and replace text across every note in the vault (or a subfolder).
-    mode: 'exact' (default, literal substring) | 'regex'.
+    mode: 'exact' (default, literal substring); regex is disabled for remote mutations.
     dry_run=True (default) only previews matches — {matches: [{path, match_count, preview}], total_matches}.
     Always run once with dry_run=True first, then dry_run=False to actually write.
     .trash/ and EXCLUDE_PATHS are always skipped; write-protected files
     (READ_ONLY or outside WRITE_PATHS) are skipped and listed under
     skipped_write_protected rather than aborting the whole run.
     Returns {replaced_in, total_replacements, skipped_write_protected} when dry_run=False."""
-    return find_replace_in_vault(search, replace, mode=mode, folder=folder, dry_run=dry_run, index=_index)
+    return find_replace_in_vault(search, replace, mode=mode, folder=folder, dry_run=dry_run, index=_index, approved_digest=approved_digest, operation_id=operation_id)
 
 
 if _feature_flags.enable_bulk_replace:
@@ -718,10 +723,16 @@ def manage_tags_tool(
 
 
 @_mutation_boundary
-def move_note_tool(from_path: str, to_path: str) -> dict:
+def move_note_tool(
+    from_path: str,
+    to_path: str,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     """Rename or move a note. Automatically rewrites all wikilinks in the vault
     that reference the old path. Returns {from, to, updated_links_in}."""
-    return move_note(from_path, to_path, index=_index)
+    return move_note(from_path, to_path, index=_index, approved_digest=approved_digest, plan_only=plan_only, operation_id=operation_id)
 
 
 if _feature_flags.enable_move:
@@ -992,10 +1003,26 @@ async def health_route(request: Request) -> Response:
     """
     if _cfg is None or _index is None:
         return JSONResponse({"status": "starting"}, status_code=503)
+    try:
+        pending_transactions = incomplete_transactions(_cfg.transaction_path)
+    except OSError:
+        pending_transactions = [{"status": "recovery_required", "reason": "transaction journal unavailable"}]
+    transaction_state = {"incomplete_transactions": len(pending_transactions)}
+    if pending_transactions:
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "index_ready": _index.is_ready(),
+                **transaction_state,
+                **(_watcher.health() if _watcher is not None else {}),
+            },
+            status_code=503,
+        )
     return JSONResponse(
         {
             "status": "ok",
             "index_ready": _index.is_ready(),
+            **transaction_state,
             **(_watcher.health() if _watcher is not None else {}),
         }
     )
@@ -1410,11 +1437,17 @@ def create_folder_tool(path: str) -> dict:
 
 
 @_mutation_boundary
-def delete_folder_tool(path: str, trash: bool = True) -> dict:
+def delete_folder_tool(
+    path: str,
+    trash: bool = True,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     """Delete a vault folder.
     trash=True (default) moves it to .trash/ instead of permanent deletion.
     Returns {path, status, trash}."""
-    return delete_folder(path, trash=trash)
+    return delete_folder(path, trash=trash, approved_digest=approved_digest, plan_only=plan_only, operation_id=operation_id)
 
 
 if _feature_flags.enable_delete:
@@ -1422,11 +1455,17 @@ if _feature_flags.enable_delete:
 
 
 @_mutation_boundary
-def rename_folder_tool(from_path: str, to_path: str) -> dict:
+def rename_folder_tool(
+    from_path: str,
+    to_path: str,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     """Rename or move a vault folder. Rewrites path-based wikilinks in all
     notes that reference notes inside the moved folder.
     Returns {from, to, notes_moved, updated_links_in}."""
-    return rename_folder(from_path, to_path, index=_index)
+    return rename_folder(from_path, to_path, index=_index, approved_digest=approved_digest, plan_only=plan_only, operation_id=operation_id)
 
 
 if _feature_flags.enable_folder_rename:
@@ -1443,12 +1482,18 @@ def list_trash_tool() -> dict:
 
 
 @_mutation_boundary
-def restore_folder_tool(trashed_name: str, to_path: str) -> dict:
+def restore_folder_tool(
+    trashed_name: str,
+    to_path: str,
+    approved_digest: str | None = None,
+    plan_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     """Restore a folder previously moved to .trash/ (see list_trash_tool for names).
     to_path: where to put it back — the original parent path can't be
     recovered from the trash entry alone, so you choose the destination.
     Returns {path, status, notes_restored}."""
-    return restore_folder(trashed_name, to_path, index=_index)
+    return restore_folder(trashed_name, to_path, index=_index, approved_digest=approved_digest, plan_only=plan_only, operation_id=operation_id)
 
 
 if _feature_flags.enable_folder_restore:
@@ -1481,8 +1526,11 @@ def vault_tags_resource() -> list:
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global _cfg, _index, _watcher
+    global _cfg, _index, _watcher, _incomplete_transactions
     _cfg = get_config()
+    _incomplete_transactions = incomplete_transactions(_cfg.transaction_path)
+    if _incomplete_transactions:
+        logger.error("%d incomplete mutation transaction(s) require operator recovery", len(_incomplete_transactions))
     policy = VaultAccessPolicy.from_config(_cfg)
     _index = VaultIndex(_cfg.vault_path, exclude_paths=_cfg.exclude_paths, policy=policy)
     _watcher = VaultWatcher(_cfg.vault_path, policy=policy)
