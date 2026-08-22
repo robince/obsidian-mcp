@@ -277,7 +277,14 @@ class OperationLedger:
         cutoff = time.time() - self.retention_seconds
         try:
             with closing(self._connect()) as db, db:
-                db.execute("DELETE FROM operations WHERE created_at < ?", (cutoff,))
+                # Pending rows are recovery evidence, not cache entries. They
+                # must survive until retry/operator reconciliation proves the
+                # outcome. The configured retention window applies only to
+                # completed replay results.
+                db.execute(
+                    "DELETE FROM operations WHERE status = 'complete' AND created_at < ?",
+                    (cutoff,),
+                )
         except LedgerUnavailableError:
             raise
         except (OSError, sqlite3.Error) as exc:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from obsidian_mcp.storage.operations import (
     OperationLedger,
     OperationOutcomeUnknownError,
 )
-from obsidian_mcp.storage.policy import VaultAccessPolicy
+from obsidian_mcp.storage.policy import VaultAccessPolicy, WritePermissionError
 from obsidian_mcp.storage.watcher import VaultWatcher
 from obsidian_mcp.tools.write import (
     append_to_note,
@@ -225,6 +226,60 @@ def test_ledger_pending_reservation_can_be_recovered(tmp_path):
     assert pending == {"_pending": True, "initial_revision": "sha256:a", "expected_result_revision": None}
     with pytest.raises(OperationConflictError):
         ledger.reserve("op", principal_id="mcp", tool_name="append", target_path="x.md", request_digest="b" * 64, initial_revision="sha256:a")
+
+
+def test_ledger_cleanup_never_expires_pending_rows(tmp_path):
+    ledger = OperationLedger(tmp_path / "ops.sqlite3", retention_seconds=1)
+    digest = "a" * 64
+    ledger.reserve(
+        "pending", principal_id="mcp", tool_name="append", target_path="x.md",
+        request_digest=digest, initial_revision="sha256:a",
+    )
+    ledger.reserve(
+        "complete", principal_id="mcp", tool_name="append", target_path="x.md",
+        request_digest=digest, initial_revision="sha256:a",
+    )
+    ledger.record(
+        "complete", principal_id="mcp", tool_name="append", target_path="x.md",
+        request_digest=digest, result={"status": "done"},
+    )
+    with sqlite3.connect(ledger.path) as db:
+        db.execute("UPDATE operations SET created_at = 0")
+    ledger.cleanup()
+    with sqlite3.connect(ledger.path) as db:
+        rows = db.execute(
+            "SELECT operation_id, status FROM operations ORDER BY operation_id"
+        ).fetchall()
+    assert rows == [("pending", "pending")]
+
+
+def test_pending_retry_reauthorizes_against_current_policy(vault_factory, monkeypatch):
+    vault_factory({"events.md": "start\n"})
+    import obsidian_mcp.config as config_module
+    from obsidian_mcp.config import get_config
+
+    ledger = OperationLedger(get_config().operation_ledger_path)
+    ledger.reserve(
+        "retry-after-policy-change",
+        principal_id="mcp",
+        tool_name="append_to_note",
+        target_path="events.md",
+        request_digest="a" * 64,
+        initial_revision=VaultStorage.from_config().revision("events.md").token,
+    )
+    monkeypatch.setenv("READ_ONLY", "true")
+    config_module._config = None
+
+    with pytest.raises(WritePermissionError):
+        append_to_note(
+            "events.md", "event", operation_id="retry-after-policy-change"
+        )
+    with sqlite3.connect(ledger.path) as db:
+        status = db.execute(
+            "SELECT status FROM operations WHERE operation_id = ?",
+            ("retry-after-policy-change",),
+        ).fetchone()
+    assert status == ("pending",)
 
 
 def test_ledger_composite_principal_scope_and_corruption(tmp_path):
