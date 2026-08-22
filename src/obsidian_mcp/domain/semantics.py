@@ -298,6 +298,7 @@ class ParserVaultSemantics:
             MutationPlan,
             PlannedMove,
             PlannedWrite,
+            directory_creates_for_destinations,
             inventory_for_paths,
         )
 
@@ -346,6 +347,9 @@ class ParserVaultSemantics:
             writes=tuple(writes),
             moves=(PlannedMove(source=source_target, destination=destination_target, original_revision=source_revision.token),),
             deletes=(),
+            directory_creates=directory_creates_for_destinations(
+                self.storage, (destination,)
+            ),
             index_changes=(
                 IndexChange("remove", source),
                 IndexChange("update", destination),
@@ -363,6 +367,7 @@ class ParserVaultSemantics:
             MutationPlan,
             PlannedMove,
             PlannedWrite,
+            directory_creates_for_destinations,
             inventory_for_paths,
         )
 
@@ -436,6 +441,9 @@ class ParserVaultSemantics:
             writes=tuple(writes),
             moves=(PlannedMove(source_target, destination_target, self.storage.tree_revision(source)),),
             deletes=(),
+            directory_creates=directory_creates_for_destinations(
+                self.storage, (destination,)
+            ),
             index_changes=tuple(
                 [*(IndexChange("remove", p) for p in moved_notes),
                  *(IndexChange("update", f"{destination}/{p[len(prefix):]}") for p in moved_notes),

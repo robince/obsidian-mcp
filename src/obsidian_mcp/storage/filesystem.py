@@ -620,9 +620,11 @@ class VaultStorage:
             _fsync_dir(parent_fd)
         return target
 
-    def make_dir(self, path: str) -> VaultPath:
+    def make_dir(self, path: str, *, create_parents: bool = True) -> VaultPath:
         target = self.resolve_write(path)
-        with _opened_parent(self.policy.root, target.relative, create=True) as (parent_fd, leaf):
+        with _opened_parent(
+            self.policy.root, target.relative, create=create_parents
+        ) as (parent_fd, leaf):
             try:
                 os.mkdir(leaf, 0o770, dir_fd=parent_fd)
                 _fsync_dir(parent_fd)
@@ -630,6 +632,17 @@ class VaultStorage:
                 info = _ensure_not_symlink(parent_fd, leaf)
                 if not stat.S_ISDIR(info.st_mode):
                     raise
+        return target
+
+    def remove_empty_dir(self, path: str) -> VaultPath:
+        """Remove one authorized real directory only when it is empty."""
+        target = self.resolve_write(path)
+        with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
+            info = _ensure_not_symlink(parent_fd, leaf)
+            if not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(target.relative)
+            os.rmdir(leaf, dir_fd=parent_fd)
+            _fsync_dir(parent_fd)
         return target
 
     def list_dir(self, path: str = "") -> list[VaultEntry]:

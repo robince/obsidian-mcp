@@ -17,9 +17,11 @@ from obsidian_mcp.storage.mutations import (
     MutationRecoveryRequiredError,
     PlanApprovalRequiredError,
     PlannedDelete,
+    PlannedDirectoryCreate,
     PlannedMove,
     PlannedWrite,
     TransactionJournal,
+    directory_creates_for_destinations,
     incomplete_transactions,
     inventory_for_paths,
     recover_transaction,
@@ -51,6 +53,43 @@ def test_move_plan_is_read_only_and_digest_is_content_sensitive(tmp_path, vault_
         metadata=(("semantic_version", "parser-v1"),),
     )
     assert changed.digest != first.digest
+
+
+def test_move_plan_explicitly_creates_missing_destination_parents(tmp_path, vault_factory):
+    vault_factory({"old.md": "body"})
+    preview = move_note("old.md", "Archive/Deep/new.md", plan_only=True)
+    assert preview["directory_creates"] == ["Archive", "Archive/Deep"]
+    move_note("old.md", "Archive/Deep/new.md")
+    assert (tmp_path / "Archive/Deep/new.md").read_text() == "body"
+
+
+def test_plan_digest_binds_directory_creation(vault_factory):
+    vault_factory({})
+    storage = VaultStorage.from_config()
+    target = storage.resolve_write("Nested/note.md")
+    without_directory = MutationPlan(
+        operation="directory-digest",
+        writes=(PlannedWrite(target, None, b"content"),),
+    )
+    with_directory = MutationPlan(
+        operation="directory-digest",
+        writes=without_directory.writes,
+        directory_creates=(
+            PlannedDirectoryCreate(storage.resolve_write("Nested")),
+        ),
+    )
+    assert without_directory.digest != with_directory.digest
+
+
+def test_executor_rejects_unplanned_missing_parent(vault_factory):
+    vault_factory({})
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="unplanned-parent",
+        writes=(PlannedWrite(storage.resolve_write("Missing/note.md"), None, b"content"),),
+    )
+    with pytest.raises(MutationPreconditionError, match="unplanned destination directory"):
+        MutationExecutor(storage).execute(plan)
 
 
 def test_move_rejects_protected_backlink_before_mutating(tmp_path, vault_factory, monkeypatch):
@@ -287,6 +326,69 @@ def test_rollback_refuses_external_edit_of_poststate(tmp_path, vault_factory, mo
         MutationExecutor(storage).execute(plan)
     assert (tmp_path / "a.md").read_text() == "external"
     assert (tmp_path / "b.md").read_text() == "bar"
+
+
+def test_rollback_removes_transaction_created_directories(tmp_path, vault_factory, monkeypatch):
+    vault_factory({"z.md": "before"})
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="directory-rollback",
+        writes=(
+            PlannedWrite(storage.resolve_write("Nested/a.md"), None, b"created"),
+            PlannedWrite(storage.resolve_write("z.md"), storage.revision("z.md").token, b"after"),
+        ),
+        directory_creates=directory_creates_for_destinations(
+            storage, ("Nested/a.md",)
+        ),
+    )
+    original_write = storage.write_bytes_atomic
+    calls = 0
+
+    def fail_second(path, content, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected write failure")
+        return original_write(path, content, **kwargs)
+
+    monkeypatch.setattr(storage, "write_bytes_atomic", fail_second)
+    with pytest.raises(OSError, match="write failure"):
+        MutationExecutor(storage).execute(plan)
+    assert not (tmp_path / "Nested").exists()
+    assert (tmp_path / "z.md").read_text() == "before"
+
+
+def test_rollback_never_removes_unexpected_directory_child(tmp_path, vault_factory, monkeypatch):
+    vault_factory({"z.md": "before"})
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="directory-rollback-external-child",
+        writes=(
+            PlannedWrite(storage.resolve_write("Nested/a.md"), None, b"created"),
+            PlannedWrite(storage.resolve_write("z.md"), storage.revision("z.md").token, b"after"),
+        ),
+        directory_creates=directory_creates_for_destinations(
+            storage, ("Nested/a.md",)
+        ),
+    )
+    original_write = storage.write_bytes_atomic
+    calls = 0
+
+    def inject_child_then_fail(path, content, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = original_write(path, content, **kwargs)
+            (tmp_path / "Nested/external.txt").write_text("external")
+            return result
+        if calls == 2:
+            raise OSError("injected write failure")
+        return original_write(path, content, **kwargs)
+
+    monkeypatch.setattr(storage, "write_bytes_atomic", inject_child_then_fail)
+    with pytest.raises(MutationRecoveryRequiredError):
+        MutationExecutor(storage).execute(plan)
+    assert (tmp_path / "Nested/external.txt").read_text() == "external"
 
 
 def test_folder_trash_collision_is_recorded_as_actual_destination(tmp_path, vault_factory):

@@ -16,6 +16,7 @@ from ..storage.mutations import (
     PlanApprovalRequiredError,
     PlannedInventory,
     PlannedMove,
+    directory_creates_for_destinations,
     inventory_for_paths,
 )
 
@@ -126,6 +127,9 @@ def restore_folder(
     plan = MutationPlan(
         operation="restore_folder",
         moves=(PlannedMove(source, destination, storage.trash_tree_revision(trashed_name), source_is_trash=True),),
+        directory_creates=directory_creates_for_destinations(
+            storage, (destination.relative,)
+        ),
         inventory=tuple(PlannedInventory(path, size, revision) for path, size, revision in storage.trash_inventory(trashed_name)),
         index_changes=restored_notes,
         metadata=(("semantic_version", "filesystem-v1"), ("trash", "true")),

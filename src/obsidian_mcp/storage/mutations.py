@@ -88,7 +88,12 @@ class PlannedMove:
 @dataclass(frozen=True)
 class PlannedDelete:
     path: VaultPath
-    original_revision: str | None = None
+    original_revision: str
+
+
+@dataclass(frozen=True)
+class PlannedDirectoryCreate:
+    path: VaultPath
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,8 @@ class MutationPlan:
     operation: str
     writes: tuple[PlannedWrite, ...] = ()
     moves: tuple[PlannedMove, ...] = ()
-    deletes: tuple[PlannedDelete | VaultPath, ...] = ()
+    deletes: tuple[PlannedDelete, ...] = ()
+    directory_creates: tuple[PlannedDirectoryCreate, ...] = ()
     index_changes: tuple[IndexChange, ...] = ()
     inventory: tuple[PlannedInventory, ...] = ()
     metadata: tuple[tuple[str, str], ...] = ()
@@ -129,11 +135,15 @@ class MutationPlan:
         # Callers may hand in lists while constructing a plan.  Normalize all
         # collections at the boundary so a digest cannot change underneath an
         # approval or transaction journal.
-        for name in ("writes", "moves", "deletes", "index_changes", "inventory"):
+        for name in (
+            "writes", "moves", "deletes", "directory_creates", "index_changes", "inventory"
+        ):
             object.__setattr__(self, name, tuple(getattr(self, name)))
         object.__setattr__(self, "metadata", tuple((str(key), str(value)) for key, value in self.metadata))
         object.__setattr__(self, "scan_revisions", tuple((str(path), str(revision)) for path, revision in self.scan_revisions))
         object.__setattr__(self, "scan_roots", tuple(str(root) for root in self.scan_roots))
+        if any(not isinstance(item, PlannedDelete) or not item.original_revision for item in self.deletes):
+            raise ValueError("Every planned delete requires an original revision")
 
     @staticmethod
     def _path(value: VaultPath | str) -> str:
@@ -166,6 +176,12 @@ class MutationPlan:
                 {"path": self._path(item.path if isinstance(item, PlannedDelete) else item), "original_revision": item.original_revision if isinstance(item, PlannedDelete) else None}
                 for item in sorted(self.deletes, key=lambda value: self._path(value.path if isinstance(value, PlannedDelete) else value))
             ],
+            "directory_creates": [
+                self._path(item.path)
+                for item in sorted(
+                    self.directory_creates, key=lambda value: self._path(value.path)
+                )
+            ],
             "inventory": [asdict(item) for item in sorted(self.inventory, key=lambda value: value.path)],
             "index_changes": [asdict(item) for item in sorted(self.index_changes, key=lambda value: (value.action, value.path))],
             "metadata": list(sorted(self.metadata)),
@@ -189,6 +205,7 @@ class MutationPlan:
             "writes": [self._path(item.path) for item in self.writes],
             "moves": [{"from": self._path(item.source), "to": self._path(item.destination)} for item in self.moves],
             "deletes": [self._path(item.path if isinstance(item, PlannedDelete) else item) for item in self.deletes],
+            "directory_creates": [self._path(item.path) for item in self.directory_creates],
             "inventory": [asdict(item) for item in self.inventory],
             "index_changes": [asdict(item) for item in self.index_changes],
             "metadata": [list(item) for item in self.metadata],
@@ -223,6 +240,29 @@ def inventory_for_paths(storage: VaultStorage, paths: list[str] | tuple[str, ...
             revision = storage.revision(path)
             entries.append(PlannedInventory(path, info.st_size, revision.token))
     return tuple(entries)
+
+
+def directory_creates_for_destinations(
+    storage: VaultStorage, paths: list[str] | tuple[str, ...]
+) -> tuple[PlannedDirectoryCreate, ...]:
+    """Plan every currently missing live-vault parent, in parent-first order."""
+    planned: dict[str, PlannedDirectoryCreate] = {}
+    for path in paths:
+        target = storage.policy.canonicalize(path)
+        parts = target.relative.split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            relative = "/".join(parts[:index])
+            if storage.exists(relative, read=False):
+                info = storage.stat(relative, read=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise NotADirectoryError(relative)
+                continue
+            directory = storage.resolve_write(relative)
+            planned.setdefault(relative, PlannedDirectoryCreate(directory))
+    return tuple(
+        planned[path]
+        for path in sorted(planned, key=lambda value: (value.count("/"), value))
+    )
 
 
 def _fsync_file(path: Path) -> None:
@@ -358,6 +398,7 @@ class MutationExecutor:
         affected_paths = {item.path for item in plan.inventory}
         affected_paths.update(self._path(item.path) for item in plan.writes)
         affected_paths.update(self._path(item.path if isinstance(item, PlannedDelete) else item) for item in plan.deletes)
+        affected_paths.update(self._path(item.path) for item in plan.directory_creates)
         inventory_paths = {item.path for item in plan.inventory}
         for move in plan.moves:
             source = self._path(move.source).rstrip("/") + "/"
@@ -422,6 +463,38 @@ class MutationExecutor:
             if current_paths != expected_paths:
                 raise MutationPreconditionError("semantic scan path inventory changed")
         seen: set[str] = set()
+        planned_directories: set[str] = set()
+        for item in plan.directory_creates:
+            directory = self.storage.resolve_write(self._path(item.path))
+            if directory.relative in planned_directories:
+                raise MutationPreconditionError(
+                    f"duplicate planned directory {directory.relative!r}"
+                )
+            planned_directories.add(directory.relative)
+
+        destinations = [self._path(item.path) for item in plan.writes]
+        destinations.extend(
+            self._path(item.destination)
+            for item in plan.moves
+            if not item.destination_is_trash
+        )
+        destinations.extend(planned_directories)
+        for destination in destinations:
+            parts = destination.split("/")[:-1]
+            for index in range(1, len(parts) + 1):
+                parent = "/".join(parts[:index])
+                if parent in planned_directories:
+                    continue
+                try:
+                    info = self.storage.stat(parent, read=False)
+                except FileNotFoundError:
+                    raise MutationPreconditionError(
+                        f"unplanned destination directory: {parent!r}"
+                    ) from None
+                if not stat.S_ISDIR(info.st_mode):
+                    raise MutationPreconditionError(
+                        f"destination parent is not a directory: {parent!r}"
+                    )
         for item in plan.writes:
             target = self.storage.resolve_write(self._path(item.path))
             if target.relative in seen:
@@ -479,6 +552,10 @@ class MutationExecutor:
 
     def validate_preconditions(self, plan: MutationPlan) -> None:
         self.authorize(plan)
+        for item in plan.directory_creates:
+            path = self._path(item.path)
+            if self.storage.exists(path, read=False):
+                raise MutationPreconditionError(f"directory destination appeared: {path!r}")
         for item in plan.writes:
             path = self._path(item.path)
             actual = _revision(self.storage, path)
@@ -521,7 +598,10 @@ class MutationExecutor:
                 raise MutationPreconditionError(f"revision changed: {path!r}")
 
     def _snapshot(self, journal: TransactionJournal, plan: MutationPlan) -> list[dict[str, Any]]:
-        paths: set[str] = set()
+        directory_create_paths = {
+            self._path(item.path) for item in plan.directory_creates
+        }
+        paths: set[str] = set(directory_create_paths)
         for item in plan.writes:
             paths.add(self._path(item.path))
         for item in plan.moves:
@@ -540,7 +620,13 @@ class MutationExecutor:
             try:
                 info = self.storage.stat(path, read=False)
             except FileNotFoundError:
-                snapshots.append({"path": path, "exists": False})
+                snapshots.append(
+                    {
+                        "path": path,
+                        "exists": False,
+                        "directory_create": path in directory_create_paths,
+                    }
+                )
                 continue
             if stat.S_ISDIR(info.st_mode):
                 snapshots.append({"path": path, "exists": True, "directory": True})
@@ -567,7 +653,7 @@ class MutationExecutor:
     def _step_action(step: dict[str, Any]) -> str | None:
         if step.get("step") == "applied":
             return step.get("action")
-        if step.get("step") in {"write", "move", "delete"}:
+        if step.get("step") in {"write", "move", "delete", "mkdir"}:
             return step.get("step")
         return None
 
@@ -582,10 +668,12 @@ class MutationExecutor:
             return f"move:{step.get('source')}:{step.get('destination')}"
         if action == "delete":
             return f"delete:{step.get('path')}"
+        if action == "mkdir":
+            return f"mkdir:{step.get('path')}"
         return None
 
     def _applied_steps(self, journal: TransactionJournal) -> list[dict[str, Any]]:
-        return [step for step in journal.state.get("steps", []) if self._step_action(step) in {"write", "move", "delete"} and step.get("step") != "intent"]
+        return [step for step in journal.state.get("steps", []) if self._step_action(step) in {"write", "move", "delete", "mkdir"} and step.get("step") != "intent"]
 
     def _pending_intents(self, journal: TransactionJournal) -> list[dict[str, Any]]:
         applied = {self._step_key(step) for step in self._applied_steps(journal)}
@@ -638,6 +726,15 @@ class MutationExecutor:
             if current.token == step.get("original_revision"):
                 return "pre"
             return "unknown"
+        if action == "mkdir":
+            path = step.get("path")
+            if not path:
+                return "unknown"
+            try:
+                info = self.storage.stat(path, read=False)
+            except FileNotFoundError:
+                return "pre"
+            return "post" if stat.S_ISDIR(info.st_mode) else "unknown"
         if action != "move":
             return "unknown"
         source = step.get("source")
@@ -731,6 +828,16 @@ class MutationExecutor:
             for step in self._pending_intents(journal)
             if step.get("action") == "delete" and step.get("_attributable_post")
         )
+        created_directory_steps = [
+            step
+            for step in self._applied_steps(journal)
+            if self._step_action(step) == "mkdir"
+        ]
+        created_directory_steps.extend(
+            step
+            for step in self._pending_intents(journal)
+            if step.get("action") == "mkdir" and step.get("_attributable_post")
+        )
         for step in reversed(move_steps):
             source, destination = step.get("source"), step.get("destination")
             try:
@@ -755,7 +862,7 @@ class MutationExecutor:
             except Exception:
                 ok = False
         for path, entry in reversed(list(snapshot_by_path.items())):
-            if entry.get("directory"):
+            if entry.get("directory") or entry.get("directory_create"):
                 continue
             try:
                 backup = journal.recovery_dir / entry["backup"] if entry.get("exists") else None
@@ -769,6 +876,17 @@ class MutationExecutor:
                         self.storage.write_bytes_atomic(path, backup.read_bytes(), expected_revision=current.token)
                 elif current is not None:
                     self.storage.remove_file(path, expected_revision=current.token)
+            except Exception:
+                ok = False
+        for step in sorted(
+            created_directory_steps,
+            key=lambda value: str(value.get("path", "")).count("/"),
+            reverse=True,
+        ):
+            path = str(step.get("path", ""))
+            try:
+                if self.storage.exists(path, read=False):
+                    self.storage.remove_empty_dir(path)
             except Exception:
                 ok = False
         return ok
@@ -847,6 +965,15 @@ class MutationExecutor:
                         return False
             except (FileNotFoundError, OSError):
                 return False
+        for step in applied:
+            if self._step_action(step) != "mkdir":
+                continue
+            try:
+                info = self.storage.stat(str(step.get("path", "")), read=False)
+            except (FileNotFoundError, OSError):
+                return False
+            if not stat.S_ISDIR(info.st_mode):
+                return False
         return True
 
     def _path_revision(self, path: str) -> str:
@@ -860,6 +987,8 @@ class MutationExecutor:
         lock_timeout = self._limits()[3]
         lock_paths = {
             self._path(item.path) for item in plan.writes
+        } | {
+            self._path(item.path) for item in plan.directory_creates
         } | {
             self._path(item.source) for item in plan.moves
         } | {
@@ -908,6 +1037,7 @@ class MutationExecutor:
             moved: list[PlannedMove] = []
             rewritten: list[str] = []
             deleted: list[str] = []
+            created_directories: list[str] = []
             try:
                 ordered_writes = sorted(plan.writes, key=lambda value: self._path(value.path))
                 write_indexes = {self._path(item.path): index for index, item in enumerate(ordered_writes)}
@@ -967,6 +1097,23 @@ class MutationExecutor:
                         post_revision=post.token,
                     )
                     rewritten.append(planned_path)
+
+                for item in sorted(
+                    plan.directory_creates,
+                    key=lambda value: (
+                        self._path(value.path).count("/"), self._path(value.path)
+                    ),
+                ):
+                    path = self._path(item.path)
+                    intent_id = f"mkdir:{path}"
+                    journal.step(
+                        "intent", action="mkdir", intent_id=intent_id, path=path
+                    )
+                    self.storage.make_dir(path, create_parents=False)
+                    journal.step(
+                        "applied", action="mkdir", intent_id=intent_id, path=path
+                    )
+                    created_directories.append(path)
 
                 for item in ordered_writes:
                     if item not in deferred_writes:
@@ -1075,6 +1222,7 @@ class MutationExecutor:
                 ],
                 "rewritten": rewritten,
                 "deleted": deleted,
+                "directories_created": created_directories,
                 "revisions": revisions,
             }
         finally:
@@ -1136,6 +1284,7 @@ def recover_transaction(storage: VaultStorage, path: str | Path, operation_id: s
     if state.get("status") in {"committed", "rolled_back", "discarded"}:
         return state
     lock_paths = set(state.get("plan", {}).get("writes", []))
+    lock_paths.update(state.get("plan", {}).get("directory_creates", []))
     inventory_paths = [item.get("path", "") for item in state.get("plan", {}).get("inventory", [])]
     lock_paths.update(item for item in inventory_paths if item)
     scan_paths = [item.get("path", "") for item in state.get("plan", {}).get("scan_revisions", [])]
@@ -1153,6 +1302,8 @@ def recover_transaction(storage: VaultStorage, path: str | Path, operation_id: s
     for step in state.get("steps", []):
         if MutationExecutor._step_action(step) == "move":
             lock_paths.update((step.get("source", ""), step.get("destination", "")))
+        elif MutationExecutor._step_action(step) == "mkdir":
+            lock_paths.add(step.get("path", ""))
     lock_paths = {item for item in lock_paths if item}
     lock_paths.update(
         str(Path(item).parent)
@@ -1228,6 +1379,14 @@ def _recover_transaction_unlocked(
             for intent in pending
             if intent.get("action") == "delete" and intent.get("_attributable_post")
         )
+        directory_steps = [
+            step for step in applied if executor._step_action(step) == "mkdir"
+        ]
+        directory_steps.extend(
+            intent
+            for intent in pending
+            if intent.get("action") == "mkdir" and intent.get("_attributable_post")
+        )
 
         def mapped_path(path: str) -> str:
             for step in moves:
@@ -1275,12 +1434,23 @@ def _recover_transaction_unlocked(
                     raise MutationRecoveryRequiredError("move post-state changed")
             elif action == "delete" and storage.exists(step.get("path", ""), read=False):
                 raise MutationRecoveryRequiredError("delete post-state is missing")
+            elif action == "mkdir":
+                try:
+                    info = storage.stat(str(step.get("path", "")), read=False)
+                except FileNotFoundError:
+                    raise MutationRecoveryRequiredError(
+                        "directory-create post-state is missing"
+                    ) from None
+                if not stat.S_ISDIR(info.st_mode):
+                    raise MutationRecoveryRequiredError(
+                        "directory-create post-state changed"
+                    )
 
         # Before restoring backups, ensure every untouched snapshot is still
         # the original state.  A changed value is never overwritten merely
         # because a transaction journal says it was involved.
         for entry in state.get("snapshots", []):
-            if entry.get("directory"):
+            if entry.get("directory") or entry.get("directory_create"):
                 continue
             path = entry.get("path", "")
             current = _revision(storage, path)
@@ -1326,7 +1496,7 @@ def _recover_transaction_unlocked(
                     expected_revision=step.get("post_tree_revision") or step.get("post_revision"),
                 )
         for entry in reversed(state.get("snapshots", [])):
-            if entry.get("directory"):
+            if entry.get("directory") or entry.get("directory_create"):
                 continue
             original = directory / "recovery" / entry.get("backup", "")
             if entry.get("exists"):
@@ -1344,6 +1514,14 @@ def _recover_transaction_unlocked(
             elif storage.exists(entry["path"], read=False):
                 current = storage.revision(entry["path"])
                 storage.remove_file(entry["path"], expected_revision=current.token)
+        for step in sorted(
+            directory_steps,
+            key=lambda value: str(value.get("path", "")).count("/"),
+            reverse=True,
+        ):
+            path = str(step.get("path", ""))
+            if storage.exists(path, read=False):
+                storage.remove_empty_dir(path)
         state["status"] = "rolled_back"
     except Exception as exc:
         state["status"] = "recovery_required"

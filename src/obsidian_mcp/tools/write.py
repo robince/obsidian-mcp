@@ -18,6 +18,7 @@ from ..storage.mutations import (
     PlanApprovalRequiredError,
     PlannedInventory,
     PlannedWrite,
+    directory_creates_for_destinations,
 )
 from ..storage.operations import OperationLedger, OperationOutcomeUnknownError
 from ..storage.policy import WritePermissionError as PolicyWritePermissionError
@@ -684,6 +685,9 @@ def find_replace_in_vault(
     plan = MutationPlan(
         operation="bulk_replace",
         writes=writes,
+        directory_creates=directory_creates_for_destinations(
+            storage, tuple(rel for rel, *_rest in candidates)
+        ),
         inventory=tuple(
             PlannedInventory(rel, len(raw.encode("utf-8")), revision or "")
             for rel, raw, _count, revision in candidates
