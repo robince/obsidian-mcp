@@ -24,6 +24,7 @@ def test_polling_invalidates_note_replaced_by_symlink(tmp_path, monkeypatch):
     watcher = VaultWatcher(tmp_path, poll_interval=0.02)
     try:
         watcher.start(changes.append)
+        watcher.mark_ready()
         _wait_until(lambda: "note.md" in changes)
         changes.clear()
         note.unlink()
@@ -52,6 +53,7 @@ def test_polling_skips_file_that_disappears_during_stat(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher._storage, "stat", disappearing_stat)
     try:
         watcher.start(changes.append)
+        watcher.mark_ready()
         _wait_until(lambda: "second.md" in changes)
     finally:
         watcher.stop()

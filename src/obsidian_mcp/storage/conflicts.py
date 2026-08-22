@@ -21,6 +21,8 @@ def _root() -> Path:
     root = get_config().conflict_path
     if root is None:
         raise ConflictStoreError("CONFLICT_PATH is not configured")
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise ConflictStoreError("conflict root is not a real directory")
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
         raise ConflictStoreError("conflict root is not a real directory")
@@ -42,7 +44,7 @@ def list_conflicts() -> list[dict]:
             raise ConflictStoreError(f"corrupt conflict metadata: {entry.name}") from exc
         if not isinstance(data, dict):
             raise ConflictStoreError(f"corrupt conflict metadata: {entry.name}")
-        result.append({"id": entry.name, **data, "has_content": any(p.name != "metadata.json" for p in entry.iterdir())})
+        result.append({**data, "id": entry.name, "has_content": any(p.name != "metadata.json" for p in entry.iterdir())})
     return result
 
 

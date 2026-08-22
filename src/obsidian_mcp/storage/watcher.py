@@ -48,6 +48,7 @@ class VaultWatcher:
         self._last_reconcile_at: float | None = None
         self._conflicts_total = 0
         self._overflow = False
+        self._overflow_generation = 0
 
     def start(self, on_change, on_reconcile=None) -> None:
         self._on_change = on_change
@@ -78,26 +79,29 @@ class VaultWatcher:
                 return
             self._releasing = True
             self._condition.notify_all()
-        overflow_reconciled = False
         try:
             while True:
                 with self._condition:
                     due = list(self._pending)
                     for path in due:
                         self._pending.pop(path, None)
-                    overflowed = self._overflow and not overflow_reconciled
+                    overflow_generation = self._overflow_generation if self._overflow else None
                 for path in due:
                     try:
                         self._on_change(path)
                     except Exception:
                         logger.exception("Watcher startup callback failed for %s", path)
                         raise
-                if overflowed:
+                if overflow_generation is not None:
                     if self._on_reconcile is None:
                         raise RuntimeError("watcher capture overflowed without reconciliation")
                     self._on_reconcile()
                     self._last_reconcile_at = time.time()
-                    overflow_reconciled = True
+                    with self._condition:
+                        # Only clear the signal if no further overflow
+                        # occurred while reconciliation was running.
+                        if self._overflow_generation == overflow_generation:
+                            self._overflow = False
                     continue
                 with self._condition:
                     if self._pending:
@@ -151,7 +155,7 @@ class VaultWatcher:
         from datetime import datetime
         return datetime.fromtimestamp(value, UTC).isoformat()
 
-    def _relative(self, path: str) -> str | None:
+    def _relative(self, path: str, *, require_read: bool = True) -> str | None:
         try:
             rel = Path(path).relative_to(self._vault_root).as_posix()
         except (ValueError, OSError):
@@ -160,21 +164,22 @@ class VaultWatcher:
             return None
         if self._is_ignored(rel):
             return None
-        return rel if self._policy.can_read(rel) else None
+        return rel if not require_read or self._policy.can_read(rel) else None
 
     @staticmethod
     def _is_ignored(rel: str) -> bool:
         name = Path(rel).name
         return name.startswith(".obsidian-mcp-") or name.endswith(".lock") or "/.trash/" in f"/{rel}/"
 
-    def _emit(self, path: str) -> None:
-        rel = self._relative(path)
+    def _emit(self, path: str, *, require_read: bool = True) -> None:
+        rel = self._relative(path, require_read=require_read)
         if rel is None:
             return
         now = time.monotonic()
         with self._condition:
             if rel not in self._pending and len(self._pending) >= self._max_pending:
                 self._overflow = True
+                self._overflow_generation += 1
                 return
             self._pending[rel] = now
             self._last_event_at = time.time()
@@ -213,9 +218,9 @@ class VaultWatcher:
                 def on_created(self, event):
                     watcher._emit(event.src_path)
                 def on_deleted(self, event):
-                    watcher._emit(event.src_path)
+                    watcher._emit(event.src_path, require_read=False)
                 def on_moved(self, event):
-                    watcher._emit(event.src_path)
+                    watcher._emit(event.src_path, require_read=False)
                     watcher._emit(event.dest_path)
 
             self._observer = Observer()
@@ -248,7 +253,7 @@ class VaultWatcher:
                         if mtimes.get(rel) != marker:
                             self._emit(str(self._vault_root / rel))
                     for rel in set(mtimes) - set(current):
-                        self._emit(str(self._vault_root / rel))
+                        self._emit(str(self._vault_root / rel), require_read=False)
                     mtimes.clear()
                     mtimes.update(current)
                 except Exception:
@@ -261,7 +266,12 @@ class VaultWatcher:
     def _reconcile_loop(self) -> None:
         while not self._stop_event.wait(self._reconcile_interval):
             try:
+                with self._condition:
+                    overflow_generation = self._overflow_generation
                 self._on_reconcile()
                 self._last_reconcile_at = time.time()
+                with self._condition:
+                    if self._overflow_generation == overflow_generation:
+                        self._overflow = False
             except Exception:
                 logger.exception("Vault reconciliation failed")

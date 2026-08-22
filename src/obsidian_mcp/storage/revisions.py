@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from ..config import get_config
@@ -91,13 +89,16 @@ def stage_conflict(
     # Never use a caller-controlled operation ID as a filesystem component.
     # The operator-facing ID is opaque and restricted to lowercase hex so it
     # cannot escape the conflict root or select an arbitrary existing path.
-    seed = operation_id if operation_id is not None else uuid.uuid4().hex
-    identifier = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    # A fresh opaque ID avoids collisions even when different principals use
+    # the same caller-scoped operation ID. Keep 64 hex characters for the
+    # operator API's deliberately narrow identifier grammar.
+    identifier = uuid.uuid4().hex + uuid.uuid4().hex
     root = cfg.conflict_path
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise OSError("conflict root must be a real directory")
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
         raise OSError("conflict root must be a real directory")
-    destination = root / identifier
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
     root_fd = os.open(root, flags)
     try:
@@ -122,9 +123,8 @@ def stage_conflict(
             finally:
                 os.close(metadata_fd)
             if cfg.store_conflict_content and proposed is not None:
-                payload_name = Path(path).name or "proposal"
                 payload_fd = os.open(
-                    payload_name,
+                    "proposed-content.bin",
                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
                     0o600,
                     dir_fd=record_fd,
@@ -139,11 +139,11 @@ def stage_conflict(
             os.close(record_fd)
     finally:
         os.close(root_fd)
-    return str(destination)
+    return identifier
 
 
-def conflict_response(exc: RevisionConflictError, *, staged_path: str | None = None) -> dict[str, Any]:
+def conflict_response(exc: RevisionConflictError, *, conflict_id: str | None = None) -> dict[str, Any]:
     result = exc.to_dict()
-    if staged_path:
-        result["staged_path"] = staged_path
+    if conflict_id:
+        result["conflict_id"] = conflict_id
     return result

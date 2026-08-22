@@ -73,8 +73,7 @@ def write_note(
                 path, content, expected_revision=effective_expected, create_only=intent.create_only
             )
         except RevisionConflictError as exc:
-            staged = stage_conflict(operation_id=operation_id, path=path, proposed=content.encode())
-            exc.staged_path = staged
+            exc.conflict_id = stage_conflict(operation_id=operation_id, path=path, proposed=content.encode())
             raise
     finally:
         lock.release()
@@ -324,7 +323,15 @@ def append_to_note(
                 create_only=(initial is None) and intent.create_only,
             )
         except RevisionConflictError as exc:
-            exc.staged_path = stage_conflict(operation_id=operation_id, path=path, proposed=patched.encode(), expected=exc.expected, actual=exc.actual.token if exc.actual else None)
+            exc.conflict_id = stage_conflict(operation_id=operation_id, path=path, proposed=patched.encode(), expected=exc.expected, actual=exc.actual.token if exc.actual else None)
+            if operation_id and ledger is not None and digest is not None:
+                ledger.abandon(
+                    operation_id,
+                    principal_id=principal_id,
+                    tool_name="append_to_note",
+                    target_path=path,
+                    request_digest=digest,
+                )
             raise
     finally:
         lock.release()

@@ -1040,7 +1040,7 @@ async def attachment_route(request: Request) -> Response:
 
     if request.method == "GET":
         try:
-            data, revision = storage.read_bytes_with_revision(path)
+            revision = storage.revision(path)
         except FileNotFoundError:
             return JSONResponse({"error": "Attachment not found"}, status_code=404)
         try:
@@ -1049,6 +1049,10 @@ async def attachment_route(request: Request) -> Response:
             return JSONResponse({"error": str(exc)}, status_code=400)
         if _etag_matches(revision, if_none):
             return Response(status_code=304, headers={"ETag": revision.etag})
+        try:
+            data, revision = storage.read_bytes_with_revision(path)
+        except FileNotFoundError:
+            return JSONResponse({"error": "Attachment not found"}, status_code=404)
         mime, _ = mimetypes.guess_type(path)
         return Response(data, media_type=mime or "application/octet-stream", headers={"ETag": revision.etag})
 
@@ -1065,7 +1069,7 @@ async def attachment_route(request: Request) -> Response:
     current = None
     if if_match is not None or if_none is not None:
         try:
-            _current_data, current = storage.read_bytes_with_revision(path)
+            current = storage.revision(path)
         except FileNotFoundError:
             current = None
 

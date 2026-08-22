@@ -223,6 +223,11 @@ class VaultIndex:
 
     def reconcile(self) -> dict[str, int]:
         """Repair missed/coalesced watcher events using content revisions."""
+        # Only remove notes which existed when this scan began. A watcher may
+        # add a newly-created note while list_files() is in progress; treating
+        # the live index as the stale baseline would remove that valid update.
+        with self._lock:
+            indexed_at_start = set(self._all_notes)
         current: set[str] = set()
         changed = 0
         for candidate in self._storage.list_files():
@@ -240,7 +245,7 @@ class VaultIndex:
                 self.update(rel)
                 changed += 1
         with self._lock:
-            stale = set(self._all_notes) - current
+            stale = (set(self._all_notes) & indexed_at_start) - current
         for rel in stale:
             self.remove(rel)
         return {"changed": changed, "removed": len(stale)}

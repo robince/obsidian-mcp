@@ -408,8 +408,9 @@ class VaultStorage:
 
     def _current_revision(self, target: VaultPath) -> FileRevision | None:
         try:
-            return self.revision(target.relative)
-        except FileNotFoundError:
+            with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
+                return _revision_at(parent_fd, leaf)
+        except (FileNotFoundError, NotADirectoryError):
             return None
 
     @staticmethod
@@ -450,7 +451,10 @@ class VaultStorage:
                 # sync writer that changed the file while the temporary file
                 # was being staged. The final rename remains the unavoidable
                 # small race described in the Phase 3 design.
-                current = self._current_revision(target)
+                try:
+                    current = _revision_at(parent_fd, leaf)
+                except FileNotFoundError:
+                    current = None
                 if create_only:
                     if current is not None:
                         raise RevisionConflictError(target.relative, None, current)
@@ -475,7 +479,7 @@ class VaultStorage:
                             follow_symlinks=False,
                         )
                     except FileExistsError:
-                        actual = self._current_revision(target)
+                        actual = _revision_at(parent_fd, leaf)
                         raise RevisionConflictError(target.relative, None, actual) from None
                     os.unlink(tmp_name, dir_fd=parent_fd)
                     _fsync_dir(parent_fd)
@@ -483,13 +487,17 @@ class VaultStorage:
                     os.rename(tmp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                     _fsync_dir(parent_fd)
                 committed = True
+                final = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                committed_revision = FileRevision.from_bytes(
+                    data, size=len(data), mtime_ns=final.st_mtime_ns
+                )
             finally:
                 if tmp_fd >= 0:
                     os.close(tmp_fd)
                 if not committed:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(tmp_name, dir_fd=parent_fd)
-        return self.revision(target.relative)
+        return committed_revision
 
     def write_text_atomic(
         self,
@@ -782,20 +790,24 @@ class VaultStorage:
                 except FileExistsError:
                     actual = self._current_revision(destination)
                     raise RevisionConflictError(destination.relative, None, actual) from None
+                source_removed = False
                 try:
                     final_revision = _revision_at(dst_parent, dst_leaf)
                     if final_revision.sha256 != source_revision.sha256:
                         raise RevisionConflictError(destination.relative, source_revision, final_revision)
-                    current_source = _revision_at(trash_fd, info.name)
-                    if current_source.sha256 != source_revision.sha256:
-                        raise RevisionConflictError(trashed_name, source_revision, current_source)
                     _fsync_dir(dst_parent)
                     os.unlink(info.name, dir_fd=trash_fd)
+                    source_removed = True
                     _fsync_dir(trash_fd)
                 except Exception:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(dst_leaf, dir_fd=dst_parent)
-                    _fsync_dir(dst_parent)
+                    # Before unlinking the trash source, removing the new hard
+                    # link rolls back cleanly. Afterwards the destination is
+                    # the only copy and must be preserved even if durability
+                    # reporting (for example fsync) fails.
+                    if not source_removed:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(dst_leaf, dir_fd=dst_parent)
+                        _fsync_dir(dst_parent)
                     raise
         return destination
 

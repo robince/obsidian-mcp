@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,12 @@ def test_revision_is_content_authoritative(vault_factory, tmp_path):
 
     (tmp_path / "note.md").write_text("two")
     assert storage.revision("note.md").sha256 != first.sha256
+
+
+def test_revision_parser_accepts_quoted_prefixed_uppercase_digest():
+    digest = "A" * 64
+    assert FileRevision.from_value(f'"sha256:{digest}"').sha256 == digest.lower()
+    assert FileRevision.from_value({"sha256": f'"sha256:{digest}"'}).sha256 == digest.lower()
 
 
 def test_stale_conditional_write_leaves_current_content_untouched(vault_factory):
@@ -204,6 +211,11 @@ def test_append_external_write_after_read_returns_conflict(vault_factory, monkey
         append_to_note("events.md", "event", operation_id="evt-race")
     assert (tmp_path / "events.md").read_text() == "sync-winner"
 
+    # A known failed write abandons its reservation, so the same operation ID
+    # can be retried against the newly observed sync state.
+    result = append_to_note("events.md", "event", operation_id="evt-race")
+    assert result["status"] == "appended"
+
 
 def test_ledger_pending_reservation_can_be_recovered(tmp_path):
     ledger = OperationLedger(tmp_path / "ops.sqlite3")
@@ -267,6 +279,7 @@ def test_operator_conflict_list_and_discard(tmp_path, vault_factory, monkeypatch
 
     staged = stage_conflict(operation_id="op-1", path="AI-Memory/a.md", proposed=b"secret")
     assert staged is not None
+    assert staged == Path(staged).name
     records = list_conflicts()
     conflict_id = records[0]["id"]
     assert conflict_id != "op-1"
@@ -274,6 +287,22 @@ def test_operator_conflict_list_and_discard(tmp_path, vault_factory, monkeypatch
     assert records[0]["has_content"] is False
     assert discard_conflict(conflict_id)["status"] == "discarded"
     assert list_conflicts() == []
+
+
+def test_conflict_ids_do_not_collide_and_payload_cannot_replace_metadata(tmp_path, vault_factory, monkeypatch):
+    vault_factory({})
+    monkeypatch.setenv("CONFLICT_PATH", str(tmp_path.parent / "conflicts"))
+    monkeypatch.setenv("STORE_CONFLICT_CONTENT", "true")
+    import obsidian_mcp.config as config_module
+    config_module._config = None
+    from obsidian_mcp.storage.revisions import stage_conflict
+
+    first = stage_conflict(operation_id="same", path="metadata.json", proposed=b"proposal")
+    second = stage_conflict(operation_id="same", path="metadata.json", proposed=b"proposal")
+    assert first != second
+    root = tmp_path.parent / "conflicts" / first
+    assert (root / "metadata.json").read_text().startswith("{")
+    assert (root / "proposed-content.bin").read_bytes() == b"proposal"
 
 
 def test_conflict_ids_are_opaque_and_symlink_safe(tmp_path, vault_factory, monkeypatch):
@@ -345,10 +374,56 @@ def test_startup_release_publishes_index_only_after_replay_and_overflow_reconcil
 
     assert index.is_ready()
     assert "during-replay.md" in index.get_all_notes()
-    assert reconciled == [True]
+    assert reconciled
+    assert watcher.health()["capture_overflow"] is False
+
+
+def test_startup_release_reconciles_an_overflow_during_reconciliation(tmp_path, monkeypatch):
+    policy = VaultAccessPolicy(tmp_path)
+    reconciled = 0
+    monkeypatch.setenv("WATCH_MODE", "poll")
+    monkeypatch.setenv("WATCHER_MAX_PENDING_EVENTS", "1")
+    watcher = VaultWatcher(tmp_path, policy=policy, poll_interval=60, reconcile_interval=0, debounce_ms=0)
+
+    def reconcile() -> None:
+        nonlocal reconciled
+        reconciled += 1
+        if reconciled == 1:
+            watcher._emit(str(tmp_path / "queued.md"))
+            watcher._emit(str(tmp_path / "overflow-again.md"))
+
+    watcher.start(lambda _path: None, on_reconcile=reconcile)
+    watcher._emit(str(tmp_path / "first.md"))
+    watcher._emit(str(tmp_path / "overflow.md"))
+    watcher.release()
+    watcher.stop()
+
+    assert reconciled == 2
+    assert watcher.health()["capture_overflow"] is False
 
 
 def test_reconcile_repairs_a_dropped_event(vault_factory, tmp_path):
     index = vault_factory({"note.md": "one"})
     (tmp_path / "note.md").write_text("two")
     assert index.reconcile() == {"changed": 1, "removed": 0}
+
+
+def test_restore_keeps_destination_after_source_unlink_if_final_fsync_fails(vault_factory, monkeypatch, tmp_path):
+    vault_factory({"note.md": "important"})
+    storage = VaultStorage.from_config()
+    _, trashed = storage.trash("note.md")
+    import obsidian_mcp.storage.filesystem as filesystem
+
+    calls = 0
+
+    def fail_second_fsync(_fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated durability failure")
+
+    monkeypatch.setattr(filesystem, "_fsync_dir", fail_second_fsync)
+    with pytest.raises(OSError, match="durability"):
+        storage.restore(trashed.name, "restored.md")
+    assert (tmp_path / "restored.md").read_text() == "important"
+    assert not trashed.exists()

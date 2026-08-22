@@ -39,13 +39,13 @@ class FileRevision:
         if isinstance(value, cls):
             return value
         if isinstance(value, str):
-            digest = value.removeprefix("sha256:").strip('"')
+            digest = value.strip().strip('"').removeprefix("sha256:").lower()
             if len(digest) != 64:
                 raise ValueError("expected_revision must be a sha256 revision")
             int(digest, 16)
             return cls(sha256=digest, size=-1, mtime_ns=-1)
         if isinstance(value, dict) and isinstance(value.get("sha256"), str):
-            digest = value["sha256"].removeprefix("sha256:").strip('"')
+            digest = value["sha256"].strip().strip('"').removeprefix("sha256:").lower()
             if len(digest) != 64:
                 raise ValueError("expected_revision must be a sha256 revision")
             int(digest, 16)
@@ -83,9 +83,9 @@ class RevisionConflictError(RuntimeError):
             "actual": self.actual.token if self.actual else None,
             "current_mtime_ns": self.actual.mtime_ns if self.actual else None,
         }
-        staged = getattr(self, "staged_path", None)
-        if staged:
-            result["staged_path"] = staged
+        conflict_id = getattr(self, "conflict_id", None)
+        if conflict_id:
+            result["conflict_id"] = conflict_id
         return result
 
 

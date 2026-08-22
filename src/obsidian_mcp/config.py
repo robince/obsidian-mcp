@@ -115,7 +115,7 @@ class Config:
         self.operation_ledger_path = (
             Path(raw_ledger).expanduser().resolve()
             if raw_ledger
-            else self.lock_path.parent / "operations.sqlite3"
+            else self.lock_path / "operations.sqlite3"
         )
         if self.operation_ledger_path == self.vault_path or self.vault_path in self.operation_ledger_path.parents:
             raise ConfigError("OPERATION_LEDGER_PATH must be outside VAULT_PATH")

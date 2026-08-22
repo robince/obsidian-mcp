@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +87,7 @@ class OperationLedger:
             raise LedgerUnavailableError(str(exc)) from exc
 
     def _initialize(self) -> None:
-        with self._raw_connect() as db:
+        with closing(self._raw_connect()) as db, db:
             info = db.execute("PRAGMA table_info(operations)").fetchall()
             if not info:
                 db.execute(self._SCHEMA)
@@ -150,13 +151,15 @@ class OperationLedger:
         self._validate(operation_id, principal_id, "unknown", "unknown", request_digest)
         self.cleanup()
         try:
-            with self._connect() as db:
+            with closing(self._connect()) as db:
                 row = db.execute(
                     "SELECT * FROM operations WHERE principal_id = ? AND operation_id = ?",
                     (principal_id, operation_id),
                 ).fetchone()
         except LedgerUnavailableError:
             raise
+        except (OSError, sqlite3.Error) as exc:
+            raise LedgerUnavailableError(str(exc)) from exc
         if row is None:
             return None
         if row["request_digest"] != request_digest:
@@ -179,7 +182,7 @@ class OperationLedger:
         self._validate(operation_id, principal_id, tool_name, target_path, request_digest)
         self.cleanup()
         try:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 # Serialize the scoped insert/read decision. The conflict
                 # clause also makes the result robust if another SQLite
                 # connection wins the reservation while this one waits.
@@ -208,7 +211,6 @@ class OperationLedger:
                         "initial_revision": row["initial_revision"],
                         "expected_result_revision": row["expected_result_revision"],
                     }
-                db.commit()
         except OperationConflictError:
             raise
         except LedgerUnavailableError:
@@ -233,7 +235,7 @@ class OperationLedger:
             raise LedgerUnavailableError("operation result must be an object")
         try:
             encoded = json.dumps(result, sort_keys=True, ensure_ascii=False)
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 updated = db.execute(
                     """UPDATE operations SET result_json = ?, result_revision = ?, status = 'complete'
                     WHERE principal_id = ? AND operation_id = ? AND tool_name = ?
@@ -242,18 +244,40 @@ class OperationLedger:
                 ).rowcount
                 if not updated:
                     raise LedgerUnavailableError("operation reservation is missing")
-                db.commit()
         except LedgerUnavailableError:
             raise
         except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
             raise LedgerUnavailableError(str(exc)) from exc
 
+    def abandon(
+        self,
+        operation_id: str,
+        *,
+        principal_id: str,
+        tool_name: str,
+        target_path: str,
+        request_digest: str,
+    ) -> None:
+        """Release an uncommitted reservation after a known failed mutation."""
+        self._validate(operation_id, principal_id, tool_name, target_path, request_digest)
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute(
+                    """DELETE FROM operations
+                    WHERE principal_id = ? AND operation_id = ? AND tool_name = ?
+                      AND target_path = ? AND request_digest = ? AND status = 'pending'""",
+                    (principal_id, operation_id, tool_name, target_path, request_digest),
+                )
+        except LedgerUnavailableError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise LedgerUnavailableError(str(exc)) from exc
+
     def cleanup(self) -> None:
         cutoff = time.time() - self.retention_seconds
         try:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 db.execute("DELETE FROM operations WHERE created_at < ?", (cutoff,))
-                db.commit()
         except LedgerUnavailableError:
             raise
         except (OSError, sqlite3.Error) as exc:
