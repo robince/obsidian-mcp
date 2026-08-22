@@ -41,9 +41,17 @@ class _NoteLockPair:
 
 def _acquire_note_locks(path: str) -> _NoteLockPair:
     cfg = get_config()
-    graph = acquire_lock(SEMANTIC_GRAPH_LOCK, lock_path=cfg.lock_path)
+    graph = acquire_lock(
+        SEMANTIC_GRAPH_LOCK,
+        timeout=cfg.mutation_lock_timeout,
+        lock_path=cfg.lock_path,
+    )
     try:
-        path_lock = acquire_lock(path, lock_path=cfg.lock_path)
+        path_lock = acquire_lock(
+            path,
+            timeout=cfg.mutation_lock_timeout,
+            lock_path=cfg.lock_path,
+        )
     except Exception:
         graph.release()
         raise
@@ -629,7 +637,8 @@ def find_replace_in_vault(
     else:
         pattern = re.compile(re.escape(search))
 
-    candidates: list[tuple[str, str, int, str | None]] = []
+    candidates: list[tuple[str, str, int, str]] = []
+    scan_revisions: list[tuple[str, str]] = []
     skipped_write_protected: list[str] = []
     for candidate in storage.list_files(folder):
         rel = candidate.relative
@@ -638,17 +647,21 @@ def find_replace_in_vault(
         if _is_excluded(rel, cfg.exclude_paths) or Path(rel).parts[0] == ".trash":
             continue
         try:
-            raw = storage.read_text(rel)
-        except Exception:
+            raw, revision = storage.read_text_with_revision(rel)
+        except Exception as exc:
+            if cfg.enable_bulk_replace:
+                raise WritePermissionError(
+                    f"bulk replacement could not inspect {rel!r}"
+                ) from exc
             continue
+        scan_revisions.append((rel, revision.token))
         count = len(pattern.findall(raw))
         if count == 0:
             continue
         if not _is_writable(rel):
             skipped_write_protected.append(rel)
             continue
-        revision = storage.revision(rel).token
-        candidates.append((rel, raw, count, revision))
+        candidates.append((rel, raw, count, revision.token))
 
     if cfg.enable_bulk_replace and skipped_write_protected:
         raise WritePermissionError(
@@ -659,11 +672,12 @@ def find_replace_in_vault(
     if sum(item[2] for item in candidates) > cfg.mutation_max_replacements:
         raise ValueError(f"replacement count exceeds configured limit ({cfg.mutation_max_replacements})")
 
+    replacement = (lambda _match: replace) if mode == "exact" else replace
     writes = tuple(
         PlannedWrite(
             path=storage.resolve_write(rel),
             original_revision=revision,
-            content=pattern.sub(replace, raw).encode("utf-8"),
+            content=pattern.sub(replacement, raw).encode("utf-8"),
         )
         for rel, raw, _count, revision in candidates
     )
@@ -682,6 +696,10 @@ def find_replace_in_vault(
             ("folder", storage.resolve_read(folder, allow_empty=True).relative),
             ("semantic_version", "parser-v1"),
         ),
+        scan_revisions=tuple(scan_revisions),
+        scan_roots=(storage.resolve_read(folder, allow_empty=True).relative,)
+        if cfg.enable_bulk_replace
+        else (),
     )
 
     if dry_run:

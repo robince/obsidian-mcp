@@ -21,7 +21,7 @@ from ..config import get_config
 from ..domain.index import VaultIndex
 from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.policy import InvalidFileTypeError
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
@@ -101,7 +101,7 @@ def write_base(
 
     known_properties = _known_properties(exclude_path=path)
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         revision = _write_base_atomic(
             storage, path, data, expected_revision=intent.expected_revision, create_only=intent.create_only
@@ -146,7 +146,7 @@ def patch_base(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Base not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         data, read_revision = _load_yaml_with_revision(storage, path)
         read_expected = expected_revision if expected_revision is not None else read_revision.token

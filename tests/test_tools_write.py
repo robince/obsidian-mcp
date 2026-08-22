@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
+import obsidian_mcp.storage.mutations as mutations_module
 import obsidian_mcp.tools.write as write_module
 from obsidian_mcp.storage.filesystem import VaultStorage
 from obsidian_mcp.tools.write import (
@@ -523,7 +524,28 @@ def test_find_replace_releases_partial_lock_set(vault_factory, monkeypatch):
             return first
         raise RuntimeError("injected lock failure")
 
-    monkeypatch.setattr(write_module, "acquire_lock", acquire_then_fail)
+    monkeypatch.setattr(mutations_module, "acquire_lock", acquire_then_fail)
     with pytest.raises(RuntimeError, match="injected"):
         find_replace_in_vault("needle", "changed", dry_run=False)
     assert first.released is True
+
+
+def test_note_lock_pair_uses_configured_mutation_timeout(vault_factory, monkeypatch):
+    vault_factory({})
+    monkeypatch.setenv("MUTATION_LOCK_TIMEOUT", "17")
+    import obsidian_mcp.config as config_module
+    config_module._config = None
+    timeouts: list[float] = []
+
+    class FakeLock:
+        def release(self):
+            pass
+
+    def fake_acquire(_path, *, timeout, **_kwargs):
+        timeouts.append(timeout)
+        return FakeLock()
+
+    monkeypatch.setattr(write_module, "acquire_lock", fake_acquire)
+    locks = write_module._acquire_note_locks("note.md")
+    locks.release()
+    assert timeouts == [17.0, 17.0]

@@ -49,7 +49,15 @@ class MutationRecoveryRequiredError(MutationError):
 
 
 def _validate_operation_id(operation_id: str) -> str:
-    if not isinstance(operation_id, str) or not operation_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in operation_id):
+    if (
+        not isinstance(operation_id, str)
+        or not operation_id
+        or operation_id in {".", ".."}
+        or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for char in operation_id
+        )
+    ):
         raise ValueError("invalid transaction ID")
     return operation_id
 
@@ -111,6 +119,9 @@ class MutationPlan:
     # separate from ``inventory`` avoids charging read-only graph scans
     # against mutation file/byte limits while still making the scan a CAS.
     scan_revisions: tuple[tuple[str, str], ...] = ()
+    # Roots whose complete readable Markdown path set was captured in
+    # scan_revisions. This detects additions as well as changes/removals.
+    scan_roots: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.operation or "/" in self.operation or "\\" in self.operation:
@@ -122,6 +133,7 @@ class MutationPlan:
             object.__setattr__(self, name, tuple(getattr(self, name)))
         object.__setattr__(self, "metadata", tuple((str(key), str(value)) for key, value in self.metadata))
         object.__setattr__(self, "scan_revisions", tuple((str(path), str(revision)) for path, revision in self.scan_revisions))
+        object.__setattr__(self, "scan_roots", tuple(str(root) for root in self.scan_roots))
 
     @staticmethod
     def _path(value: VaultPath | str) -> str:
@@ -161,6 +173,7 @@ class MutationPlan:
                 {"path": path, "revision": revision}
                 for path, revision in sorted(self.scan_revisions)
             ],
+            "scan_roots": list(sorted(self.scan_roots)),
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -183,6 +196,7 @@ class MutationPlan:
                 {"path": path, "revision": revision}
                 for path, revision in self.scan_revisions
             ],
+            "scan_roots": list(self.scan_roots),
         }
 
 
@@ -245,7 +259,9 @@ class TransactionJournal:
     def __init__(self, root: str | Path, operation_id: str | None = None) -> None:
         self.root = Path(root).resolve()
         self.operation_id = _validate_operation_id(operation_id) if operation_id is not None else uuid.uuid4().hex
-        self.directory = self.root / self.operation_id
+        self.directory = (self.root / self.operation_id).resolve()
+        if self.directory.parent != self.root:
+            raise ValueError("invalid transaction ID")
         self.stage_dir = self.directory / "stage"
         self.recovery_dir = self.directory / "recovery"
         self.journal_path = self.directory / "journal.json"
@@ -307,6 +323,9 @@ class TransactionJournal:
             try:
                 data = json.loads(journal.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError):
+                result.append({"operation_id": journal.parent.name, "status": "corrupt", "path": str(journal)})
+                continue
+            if not isinstance(data, dict):
                 result.append({"operation_id": journal.parent.name, "status": "corrupt", "path": str(journal)})
                 continue
             if data.get("status") not in {"committed", "rolled_back", "discarded"}:
@@ -392,6 +411,16 @@ class MutationExecutor:
             actual = _revision(self.storage, path)
             if actual is None or actual.token != expected:
                 raise MutationPreconditionError(f"semantic scan changed: {path!r}")
+        if plan.scan_roots:
+            expected_paths = {path for path, _revision in plan.scan_revisions}
+            current_paths = {
+                candidate.relative
+                for root in plan.scan_roots
+                for candidate in self.storage.list_files(root)
+                if candidate.relative.lower().endswith(".md")
+            }
+            if current_paths != expected_paths:
+                raise MutationPreconditionError("semantic scan path inventory changed")
         seen: set[str] = set()
         for item in plan.writes:
             target = self.storage.resolve_write(self._path(item.path))
@@ -428,7 +457,11 @@ class MutationExecutor:
                 self.storage.authorize_tree(source.relative)
                 if not item.destination_is_trash:
                     self.storage.authorize_tree(source.relative, destination=destination.relative)
-            if destination.relative in seen or source.relative in seen:
+            source_write_overlap = (
+                plan.operation == "move_note"
+                and source.relative in {self._path(write.path) for write in plan.writes}
+            )
+            if destination.relative in seen or (source.relative in seen and not source_write_overlap):
                 raise MutationPreconditionError("planned paths overlap")
             seen.update((source.relative, destination.relative))
         for item in plan.deletes:
@@ -688,6 +721,16 @@ class MutationExecutor:
             for step in self._pending_intents(journal)
             if step.get("action") == "move" and step.get("_attributable_post")
         )
+        applied_deletes = {
+            str(step.get("path"))
+            for step in self._applied_steps(journal)
+            if self._step_action(step) == "delete"
+        }
+        applied_deletes.update(
+            str(step.get("path"))
+            for step in self._pending_intents(journal)
+            if step.get("action") == "delete" and step.get("_attributable_post")
+        )
         for step in reversed(move_steps):
             source, destination = step.get("source"), step.get("destination")
             try:
@@ -719,8 +762,11 @@ class MutationExecutor:
                 current = _revision(self.storage, path)
                 if backup:
                     if current is None:
-                        raise MutationRecoveryRequiredError(f"post-state is missing for {path!r}")
-                    self.storage.write_bytes_atomic(path, backup.read_bytes(), expected_revision=current.token)
+                        if path not in applied_deletes:
+                            raise MutationRecoveryRequiredError(f"post-state is missing for {path!r}")
+                        self.storage.write_bytes_atomic(path, backup.read_bytes(), create_only=True)
+                    else:
+                        self.storage.write_bytes_atomic(path, backup.read_bytes(), expected_revision=current.token)
                 elif current is not None:
                     self.storage.remove_file(path, expected_revision=current.token)
             except Exception:
@@ -747,7 +793,10 @@ class MutationExecutor:
             for step in move_steps:
                 if step.get("restore") or step.get("trash"):
                     continue
-                source = str(step.get("source", "")).rstrip("/") + "/"
+                source_path = str(step.get("source", ""))
+                source = source_path.rstrip("/") + "/"
+                if path == source_path:
+                    return str(step.get("destination", ""))
                 if path.startswith(source):
                     return str(step.get("destination", "")).rstrip("/") + "/" + path[len(source):]
             return path
@@ -809,7 +858,6 @@ class MutationExecutor:
             raise PlanDigestMismatchError("approved plan digest does not match the current plan")
         self.validate_preconditions(plan)
         lock_timeout = self._limits()[3]
-        semantic_lock_needed = dict(plan.metadata).get("semantic_version") is not None
         lock_paths = {
             self._path(item.path) for item in plan.writes
         } | {
@@ -843,8 +891,7 @@ class MutationExecutor:
             # Acquire the graph lock first, before path locks.  Ordinary note
             # writers follow the same order, preventing a graph-scan/path
             # lock inversion while a semantic plan is being committed.
-            if semantic_lock_needed:
-                locks.append(acquire_lock(SEMANTIC_GRAPH_LOCK, timeout=lock_timeout, lock_path=self._lock_path()))
+            locks.append(acquire_lock(SEMANTIC_GRAPH_LOCK, timeout=lock_timeout, lock_path=self._lock_path()))
             for path in sorted(lock_paths):
                 locks.append(acquire_lock(path, timeout=lock_timeout, lock_path=self._lock_path()))
             # The plan was validated before locks, then is checked again while
@@ -865,13 +912,16 @@ class MutationExecutor:
                 ordered_writes = sorted(plan.writes, key=lambda value: self._path(value.path))
                 write_indexes = {self._path(item.path): index for index, item in enumerate(ordered_writes)}
                 deferred_writes: list[PlannedWrite] = []
-                if plan.operation == "rename_folder":
+                if plan.operation in {"rename_folder", "move_note"}:
                     for item in ordered_writes:
                         path = self._path(item.path)
                         if any(
                             not move.source_is_trash
                             and not move.destination_is_trash
-                            and path.startswith(self._path(move.source).rstrip("/") + "/")
+                            and (
+                                path == self._path(move.source)
+                                or path.startswith(self._path(move.source).rstrip("/") + "/")
+                            )
                             for move in plan.moves
                         ):
                             deferred_writes.append(item)
@@ -879,8 +929,13 @@ class MutationExecutor:
                 def mapped_write_path(path: str) -> str:
                     if path in {self._path(item.path) for item in deferred_writes}:
                         for move in plan.moves:
-                            source = self._path(move.source).rstrip("/") + "/"
-                            if not move.source_is_trash and not move.destination_is_trash and path.startswith(source):
+                            source_path = self._path(move.source)
+                            source = source_path.rstrip("/") + "/"
+                            if move.source_is_trash or move.destination_is_trash:
+                                continue
+                            if path == source_path:
+                                return self._path(move.destination)
+                            if path.startswith(source):
                                 return self._path(move.destination).rstrip("/") + "/" + path[len(source):]
                     return path
 
@@ -1048,10 +1103,16 @@ def incomplete_transactions(path: str | Path) -> list[dict[str, Any]]:
 def discard_transaction(path: str | Path, operation_id: str) -> None:
     """Mark a transaction discarded without deleting recovery evidence."""
     _validate_operation_id(operation_id)
-    journal = Path(path).resolve() / operation_id / "journal.json"
+    root = Path(path).resolve()
+    directory = (root / operation_id).resolve()
+    if directory.parent != root:
+        raise ValueError("invalid transaction ID")
+    journal = directory / "journal.json"
     if not journal.is_file() or journal.is_symlink():
         raise FileNotFoundError(operation_id)
     data = json.loads(journal.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise MutationRecoveryRequiredError("transaction journal is corrupt")
     if data.get("status") in {"committed", "rolled_back", "discarded"}:
         return
     data["status"] = "discarded"
@@ -1063,11 +1124,15 @@ def recover_transaction(storage: VaultStorage, path: str | Path, operation_id: s
     """Acquire the same stable path locks used by execution before recovery."""
     root = Path(path).resolve()
     _validate_operation_id(operation_id)
-    directory = root / operation_id
+    directory = (root / operation_id).resolve()
+    if directory.parent != root:
+        raise ValueError("invalid transaction ID")
     journal_path = directory / "journal.json"
     if not journal_path.is_file() or journal_path.is_symlink():
         raise FileNotFoundError(operation_id)
     state = json.loads(journal_path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict):
+        raise MutationRecoveryRequiredError("transaction journal is corrupt")
     if state.get("status") in {"committed", "rolled_back", "discarded"}:
         return state
     lock_paths = set(state.get("plan", {}).get("writes", []))
@@ -1086,7 +1151,7 @@ def recover_transaction(storage: VaultStorage, path: str | Path, operation_id: s
         )
     lock_paths.update(item for item in state.get("plan", {}).get("deletes", []) if item)
     for step in state.get("steps", []):
-        if step.get("step") == "move":
+        if MutationExecutor._step_action(step) == "move":
             lock_paths.update((step.get("source", ""), step.get("destination", "")))
     lock_paths = {item for item in lock_paths if item}
     lock_paths.update(
@@ -1096,15 +1161,13 @@ def recover_transaction(storage: VaultStorage, path: str | Path, operation_id: s
     )
     from ..config import get_config
 
-    locks = []
-    if dict(tuple(item) for item in state.get("plan", {}).get("metadata", [])).get("semantic_version") is not None:
-        locks.append(
-            acquire_lock(
-                SEMANTIC_GRAPH_LOCK,
-                timeout=get_config().mutation_lock_timeout,
-                lock_path=get_config().lock_path,
-            )
+    locks = [
+        acquire_lock(
+            SEMANTIC_GRAPH_LOCK,
+            timeout=get_config().mutation_lock_timeout,
+            lock_path=get_config().lock_path,
         )
+    ]
     try:
         locks.extend(
             acquire_lock(item, timeout=get_config().mutation_lock_timeout, lock_path=get_config().lock_path)
@@ -1159,12 +1222,21 @@ def _recover_transaction_unlocked(
             for intent in pending
             if intent.get("action") == "move" and intent.get("_attributable_post")
         )
+        delete_steps = [step for step in applied if executor._step_action(step) == "delete"]
+        delete_steps.extend(
+            intent
+            for intent in pending
+            if intent.get("action") == "delete" and intent.get("_attributable_post")
+        )
 
         def mapped_path(path: str) -> str:
             for step in moves:
                 if step.get("trash") or step.get("restore"):
                     continue
-                source = str(step.get("source", "")).rstrip("/") + "/"
+                source_path = str(step.get("source", ""))
+                source = source_path.rstrip("/") + "/"
+                if path == source_path:
+                    return str(step.get("destination", ""))
                 if path.startswith(source):
                     return str(step.get("destination", "")).rstrip("/") + "/" + path[len(source):]
             return path
@@ -1184,7 +1256,11 @@ def _recover_transaction_unlocked(
             elif action == "move":
                 source, destination = step.get("source"), step.get("destination")
                 if step.get("trash"):
-                    if storage.exists(source, read=False) or not storage.trash_info(Path(destination).name):
+                    try:
+                        trash_present = storage.trash_info(Path(destination).name)
+                    except FileNotFoundError:
+                        trash_present = None
+                    if storage.exists(source, read=False) or trash_present is None:
                         raise MutationRecoveryRequiredError("trash post-state is missing")
                     if storage.trash_tree_revision(Path(destination).name) != step.get("post_tree_revision"):
                         raise MutationRecoveryRequiredError("trash post-state changed")
@@ -1212,6 +1288,8 @@ def _recover_transaction_unlocked(
                 if current is not None and current.token == entry.get("revision"):
                     continue
                 if current is None and mapped_path(path) != path:
+                    continue
+                if current is None and any(step.get("path") == path for step in delete_steps):
                     continue
                 if current is not None and any(
                     executor._step_action(step) == "write" and mapped_path(step.get("path", "")) == path
@@ -1254,8 +1332,15 @@ def _recover_transaction_unlocked(
             if entry.get("exists"):
                 if not original.is_file() or original.is_symlink():
                     raise MutationRecoveryRequiredError("recovery copy is missing")
-                current = storage.revision(entry["path"])
-                storage.write_bytes_atomic(entry["path"], original.read_bytes(), expected_revision=current.token)
+                current = _revision(storage, entry["path"])
+                if current is None:
+                    if not any(step.get("path") == entry["path"] for step in delete_steps):
+                        raise MutationRecoveryRequiredError("snapshot post-state is missing")
+                    storage.write_bytes_atomic(entry["path"], original.read_bytes(), create_only=True)
+                else:
+                    storage.write_bytes_atomic(
+                        entry["path"], original.read_bytes(), expected_revision=current.token
+                    )
             elif storage.exists(entry["path"], read=False):
                 current = storage.revision(entry["path"])
                 storage.remove_file(entry["path"], expected_revision=current.token)

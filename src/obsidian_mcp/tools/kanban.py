@@ -15,7 +15,7 @@ from ..domain.index import VaultIndex
 from ..domain.models import FileRevision
 from ..domain.parser import parse_note
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.policy import InvalidFileTypeError
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
@@ -80,7 +80,7 @@ def create_kanban_board(
         lines += [f"## {col}", ""]
     content = "\n".join(lines)
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         revision = storage.write_text_atomic(
             path, content, expected_revision=intent.expected_revision, create_only=intent.create_only
@@ -112,7 +112,7 @@ def add_kanban_card(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Kanban board not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         raw, read_revision = storage.read_text_with_revision(path)
         read_expected = expected_revision if expected_revision is not None else read_revision.token
@@ -157,7 +157,7 @@ def move_kanban_card(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Kanban board not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         raw, read_revision = storage.read_text_with_revision(path)
         read_expected = expected_revision if expected_revision is not None else read_revision.token
@@ -204,7 +204,7 @@ def delete_kanban_card(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Kanban board not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         raw, read_revision = storage.read_text_with_revision(path)
         read_expected = expected_revision if expected_revision is not None else read_revision.token

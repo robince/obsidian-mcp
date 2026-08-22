@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import obsidian_mcp.config as cfg_mod
+import obsidian_mcp.storage.filesystem as filesystem_module
+import obsidian_mcp.storage.mutations as mutations_module
 from obsidian_mcp.domain.semantics import ParserVaultSemantics, SemanticAmbiguityError
 from obsidian_mcp.storage.filesystem import VaultStorage
 from obsidian_mcp.storage.mutations import (
@@ -12,11 +16,13 @@ from obsidian_mcp.storage.mutations import (
     MutationPreconditionError,
     MutationRecoveryRequiredError,
     PlanApprovalRequiredError,
+    PlannedDelete,
     PlannedMove,
     PlannedWrite,
     TransactionJournal,
     incomplete_transactions,
     inventory_for_paths,
+    recover_transaction,
 )
 from obsidian_mcp.storage.policy import WritePermissionError
 from obsidian_mcp.tools.folders import delete_folder, rename_folder, restore_folder
@@ -49,7 +55,7 @@ def test_move_plan_is_read_only_and_digest_is_content_sensitive(tmp_path, vault_
 
 def test_move_rejects_protected_backlink_before_mutating(tmp_path, vault_factory, monkeypatch):
     vault_factory({"Allowed/old.md": "body", "outside.md": "[[Allowed/old]]"})
-    _enable(monkeypatch, ENABLE_MOVE=True, WRITE_PATHS="Allowed")
+    _enable(monkeypatch, ENABLE_MOVE=True, WRITE_PATHS="Allowed/")
     plan = move_note("Allowed/old.md", "Allowed/new.md", plan_only=True)
     with pytest.raises(WritePermissionError):
         move_note("Allowed/old.md", "Allowed/new.md", approved_digest=plan["plan_digest"])
@@ -79,6 +85,18 @@ def test_move_link_corpus_handles_tilde_and_multibacktick_code(tmp_path, vault_f
     assert "~~~md\n[[old]]\n~~~~" in content
     assert "``[[old]]``" in content
     assert content.endswith("[[new]]")
+
+
+def test_move_does_not_rewrite_wikilink_inside_code_span_with_shorter_runs(tmp_path, vault_factory):
+    vault_factory({"old.md": "body", "links.md": "`` ` [[old]] ` ``\n[[old]]"})
+    move_note("old.md", "new.md")
+    assert (tmp_path / "links.md").read_text() == "`` ` [[old]] ` ``\n[[new]]"
+
+
+def test_move_rewrites_self_reference_at_destination(tmp_path, vault_factory):
+    vault_factory({"old.md": "# Heading\n[[old#Heading]]"})
+    move_note("old.md", "new.md")
+    assert (tmp_path / "new.md").read_text() == "# Heading\n[[new#Heading]]"
 
 
 def test_move_rejects_duplicate_stem_ambiguity(vault_factory):
@@ -115,6 +133,25 @@ def test_enabled_bulk_requires_approved_plan_and_detects_stale_revision(vault_fa
     VaultStorage.from_config().write_text_atomic("a.md", "changed")
     with pytest.raises(PlanApprovalRequiredError):
         find_replace_in_vault("foo", "bar", dry_run=False, approved_digest=dry["plan_digest"])
+
+
+def test_scan_root_precondition_detects_new_markdown_file(vault_factory):
+    vault_factory({"a.md": "one"})
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="scan-only",
+        scan_revisions=(("a.md", storage.revision("a.md").token),),
+        scan_roots=("",),
+    )
+    storage.write_text_atomic("new.md", "new", create_only=True)
+    with pytest.raises(MutationPreconditionError, match="path inventory"):
+        MutationExecutor(storage).execute(plan)
+
+
+def test_exact_bulk_replacement_keeps_backslashes_literal(tmp_path, vault_factory):
+    vault_factory({"a.md": "needle"})
+    find_replace_in_vault("needle", r"\1\n", dry_run=False)
+    assert (tmp_path / "a.md").read_text() == r"\1\n"
 
 
 def test_remote_bulk_regex_is_always_rejected(vault_factory, monkeypatch):
@@ -158,6 +195,19 @@ def test_folder_rename_rewrites_internal_link_after_tree_move(tmp_path, vault_fa
     assert (tmp_path / "New/b.md").read_text() == "body"
     assert "New/a.md" in idx.get_backlinks("New/b.md")
     assert incomplete_transactions(cfg_mod.get_config().transaction_path) == []
+
+
+def test_folder_rename_rebases_relative_links_from_mapped_note_path(tmp_path, vault_factory):
+    vault_factory({"Old/Sub/a.md": "[[../b]]", "Old/b.md": "body"})
+    rename_folder("Old", "Archive/New")
+    assert (tmp_path / "Archive/New/Sub/a.md").read_text() == "[[../b]]"
+
+
+def test_folder_rename_preview_and_commit_report_same_notes_moved(vault_factory):
+    vault_factory({"Old/a.md": "body", "outside.md": "[[Old/a]]"})
+    preview = rename_folder("Old", "New", plan_only=True)
+    result = rename_folder("Old", "New")
+    assert preview["notes_moved"] == result["notes_moved"] == 1
 
 
 def test_folder_rename_rolls_back_if_move_crashes_before_internal_rewrite(vault_factory, monkeypatch):
@@ -245,6 +295,30 @@ def test_folder_trash_collision_is_recorded_as_actual_destination(tmp_path, vaul
     (tmp_path / ".trash/Temp").mkdir()
     result = delete_folder("Temp")
     assert result["moved"][0]["to"].startswith(".trash/Temp-")
+
+
+def test_trash_collision_retry_is_bounded(vault_factory, monkeypatch):
+    vault_factory({"note.md": "content"})
+    calls = 0
+
+    def always_collide(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise FileExistsError
+
+    monkeypatch.setattr(filesystem_module, "_rename_noreplace", always_collide)
+    with pytest.raises(FileExistsError, match="Unable to reserve"):
+        VaultStorage.from_config().trash("note.md")
+    assert calls == 16
+
+
+def test_live_and_trash_tree_revisions_use_same_order(vault_factory):
+    vault_factory({"Old/b/z.md": "nested", "Old/b.md": "sibling"})
+    storage = VaultStorage.from_config()
+    live = storage.tree_revision("Old").removeprefix("tree:")
+    storage.trash("Old")
+    trashed = storage.trash_tree_revision("Old").removeprefix("trash:")
+    assert trashed == live
 
 
 def test_crash_after_trash_move_before_applied_journal_rolls_back(tmp_path, vault_factory, monkeypatch):
@@ -425,6 +499,86 @@ def test_orphan_transaction_directory_is_reported(tmp_path):
     orphan.mkdir(parents=True)
     findings = TransactionJournal.scan(orphan.parent)
     assert findings == [{"operation_id": "orphan-id", "status": "orphan", "path": str(orphan)}]
+
+
+def test_non_object_transaction_journal_is_reported_corrupt(tmp_path):
+    directory = tmp_path / "transactions" / "bad"
+    directory.mkdir(parents=True)
+    (directory / "journal.json").write_text("[]")
+    assert TransactionJournal.scan(directory.parent)[0]["status"] == "corrupt"
+
+
+@pytest.mark.parametrize("operation_id", [".", ".."])
+def test_transaction_ids_reject_traversal_names(tmp_path, operation_id):
+    with pytest.raises(ValueError, match="invalid transaction ID"):
+        TransactionJournal(tmp_path / "transactions", operation_id)
+
+
+def test_recovery_locks_applied_collision_destination_and_reports_missing_trash(
+    tmp_path, vault_factory, monkeypatch
+):
+    vault_factory({})
+    root = tmp_path.parent / "transactions"
+    directory = root / "op"
+    directory.mkdir(parents=True)
+    state = {
+        "operation_id": "op",
+        "status": "committing",
+        "plan": {
+            "writes": [], "inventory": [], "scan_revisions": [], "deletes": [],
+            "moves": [{"from": "Folder", "to": ".trash/Folder"}], "metadata": [],
+        },
+        "steps": [{
+            "step": "applied", "action": "move", "source": "Folder",
+            "destination": ".trash/Folder-collision", "trash": True,
+            "post_tree_revision": "trash:missing",
+        }],
+        "snapshots": [],
+    }
+    (directory / "journal.json").write_text(json.dumps(state))
+    locked: list[str] = []
+
+    class FakeLock:
+        def release(self):
+            pass
+
+    def record_lock(path, **_kwargs):
+        locked.append(path)
+        return FakeLock()
+
+    monkeypatch.setattr(mutations_module, "acquire_lock", record_lock)
+    result = recover_transaction(VaultStorage.from_config(), root, "op")
+    assert ".trash/Folder-collision" in locked
+    assert result["status"] == "recovery_required"
+    assert "trash post-state is missing" in result["error"]
+
+
+def test_delete_rollback_recreates_absent_file(tmp_path, vault_factory, monkeypatch):
+    vault_factory({"a.md": "one", "b.md": "two"})
+    _enable(monkeypatch, ALLOW_PERMANENT_DELETE=True)
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="two-deletes",
+        deletes=(
+            PlannedDelete(storage.resolve_delete("a.md", permanent=True), storage.revision("a.md").token),
+            PlannedDelete(storage.resolve_delete("b.md", permanent=True), storage.revision("b.md").token),
+        ),
+    )
+    original_delete = storage.delete
+    calls = 0
+
+    def fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected delete failure")
+        return original_delete(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "delete", fail_second)
+    with pytest.raises(OSError, match="delete failure"):
+        MutationExecutor(storage).execute(plan)
+    assert (tmp_path / "a.md").read_text() == "one"
+    assert (tmp_path / "b.md").read_text() == "two"
 
 
 def test_directory_inventory_counts_against_file_limit_before_mutation(tmp_path, vault_factory, monkeypatch):

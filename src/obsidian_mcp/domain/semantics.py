@@ -46,8 +46,6 @@ class VaultSemantics(Protocol):
 # broad substitution: frontmatter and fenced code are not prose links, and the
 # optional embed marker must survive unchanged.
 _LINK_RE = re.compile(r"(?P<embed>!?)\[\[(?P<target>[^\]|#^]+)(?P<suffix>(?:[#^][^\]|]*(?:\|[^\]]*)?|\|[^\]]*)?)\]\]")
-_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
-_MULTI_INLINE_CODE_RE = re.compile(r"(?<!`)`{2,}[^`\n]+`{2,}(?!`)")
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n?", re.DOTALL)
 
 
@@ -73,6 +71,39 @@ def _fence_ranges(raw: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _code_span_ranges(raw: str) -> list[tuple[int, int]]:
+    """Return inline code spans paired by equal-length backtick runs."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(raw):
+        start = raw.find("`", cursor)
+        if start < 0:
+            break
+        opener_end = start
+        while opener_end < len(raw) and raw[opener_end] == "`":
+            opener_end += 1
+        width = opener_end - start
+        search = opener_end
+        closing_end = None
+        while search < len(raw):
+            closing = raw.find("`", search)
+            if closing < 0:
+                break
+            run_end = closing
+            while run_end < len(raw) and raw[run_end] == "`":
+                run_end += 1
+            if run_end - closing == width:
+                closing_end = run_end
+                break
+            search = run_end
+        if closing_end is None:
+            cursor = opener_end
+            continue
+        ranges.append((start, closing_end))
+        cursor = closing_end
+    return ranges
+
+
 def _replace_prose(raw: str, transform, *, pattern: re.Pattern[str] = _LINK_RE) -> str:
     """Apply ``transform`` to wikilinks outside frontmatter and code fences."""
     protected: list[tuple[int, int, str]] = []
@@ -80,10 +111,8 @@ def _replace_prose(raw: str, transform, *, pattern: re.Pattern[str] = _LINK_RE) 
         protected.append((match.start(), match.end(), match.group(0)))
     for start, end in _fence_ranges(raw):
         protected.append((start, end, raw[start:end]))
-    for match in _INLINE_CODE_RE.finditer(raw):
-        protected.append((match.start(), match.end(), match.group(0)))
-    for match in _MULTI_INLINE_CODE_RE.finditer(raw):
-        protected.append((match.start(), match.end(), match.group(0)))
+    for start, end in _code_span_ranges(raw):
+        protected.append((start, end, raw[start:end]))
     protected.sort()
     chunks: list[str] = []
     cursor = 0
@@ -208,7 +237,14 @@ class ParserVaultSemantics:
         if source_matches and ("/" in target_noext or target_norm.lower().endswith(".md") or target_noext.startswith(("./", "../"))):
             replacement = destination_noext
             if target_noext.startswith(("./", "../")):
-                replacement = posixpath.relpath(destination_noext, posixpath.dirname(source_path) or ".")
+                linking_path = (
+                    destination_path
+                    if source_path.casefold() == source.casefold()
+                    else source_path
+                )
+                replacement = posixpath.relpath(
+                    destination_noext, posixpath.dirname(linking_path) or "."
+                )
                 if not replacement.startswith("."):
                     replacement = "./" + replacement
             return replacement if not target_norm.lower().endswith(".md") else replacement + ".md"
@@ -283,12 +319,13 @@ class ParserVaultSemantics:
         if get_config().enable_move:
             self._assert_complete_scan()
 
-        source_bytes, source_revision = self.storage.read_bytes_with_revision(source)
         notes = self._readable_notes()
+        source_note = next((note for note in notes if note.path.relative == source), None)
+        if source_note is None:
+            raise ReadPermissionError("multi-file mutation cannot inspect the source note")
+        source_revision = source_note.revision
         writes: list[PlannedWrite] = []
         for note in notes:
-            if note.path.relative == source:
-                continue
             rewritten, changed = self.rewrite_links(
                 note.content.decode("utf-8", "replace"),
                 source,
@@ -312,11 +349,12 @@ class ParserVaultSemantics:
             index_changes=(
                 IndexChange("remove", source),
                 IndexChange("update", destination),
-                *(IndexChange("update", item.path.relative) for item in writes),
+                *(IndexChange("update", item.path.relative) for item in writes if item.path.relative != source),
             ),
             inventory=inventory_for_paths(self.storage, (source,)),
             metadata=(("semantic_version", "parser-v1"),),
             scan_revisions=tuple((note.path.relative, note.revision.token) for note in notes),
+            scan_roots=("",),
         )
 
     def plan_folder_rename(self, source: str, destination: str):
@@ -376,7 +414,11 @@ class ParserVaultSemantics:
                 suffix = resolved[len(prefix):] if resolved.casefold().startswith(prefix.casefold()) else ""
                 mapped = f"{destination}/{suffix}" if suffix else destination
                 if target.startswith(("./", "../")):
-                    mapped = posixpath.relpath(mapped, posixpath.dirname(note_path) or ".")
+                    mapped_note_path = note_path
+                    if note_path == source or note_path.startswith(prefix):
+                        note_suffix = note_path[len(prefix):] if note_path.startswith(prefix) else ""
+                        mapped_note_path = f"{destination}/{note_suffix}" if note_suffix else destination
+                    mapped = posixpath.relpath(mapped, posixpath.dirname(mapped_note_path) or ".")
                     if not mapped.startswith("."):
                         mapped = "./" + mapped
                 changed = True
@@ -402,4 +444,5 @@ class ParserVaultSemantics:
             inventory=inventory_for_paths(self.storage, (source,)),
             metadata=(("semantic_version", "parser-v1"),),
             scan_revisions=tuple((note.path.relative, note.revision.token) for note in notes),
+            scan_roots=("",),
         )

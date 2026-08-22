@@ -22,7 +22,7 @@ from ..domain.index import VaultIndex
 from ..domain.models import FileRevision
 from ..domain.parser import parse_note
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.policy import InvalidFileTypeError
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
@@ -111,7 +111,7 @@ def write_excalidraw(
     built_elements = [_normalize_element(e) for e in (elements or [])]
     data = _build_scene(built_elements, app_state or {})
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         revision = storage.write_text_atomic(
             path,
@@ -149,7 +149,7 @@ def patch_excalidraw(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Excalidraw file not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         raw, read_revision = storage.read_text_with_revision(path)
         read_expected = expected_revision if expected_revision is not None else read_revision.token

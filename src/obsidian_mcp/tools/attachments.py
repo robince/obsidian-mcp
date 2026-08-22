@@ -12,7 +12,7 @@ from urllib.parse import quote, urlencode
 from ..config import get_config
 from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.policy import InvalidFileTypeError
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
@@ -135,7 +135,9 @@ def write_attachment_bytes(
         )
 
     intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(
+        path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path
+    )
     try:
         revision = storage.write_bytes_atomic(
             path, data, expected_revision=intent.expected_revision, create_only=intent.create_only

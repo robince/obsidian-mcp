@@ -792,7 +792,7 @@ class VaultStorage:
                                 raise RevisionConflictError(source.relative, expected, actual)
                     fixed_destination = destination_name is not None
                     base_name = destination_name or source.relative.rsplit("/", 1)[-1]
-                    while True:
+                    for _attempt in range(16):
                         destination_name = base_name
                         if not fixed_destination:
                             try:
@@ -814,6 +814,9 @@ class VaultStorage:
                             # atomically.
                             continue
                         return source, self.policy.root / ".trash" / destination_name
+                    raise FileExistsError(
+                        f"Unable to reserve a trash destination for {source.relative!r}"
+                    )
             finally:
                 os.close(trash_fd)
 
@@ -890,7 +893,8 @@ class VaultStorage:
             item_fd = os.open(trashed_name, _dir_flags(), dir_fd=trash_fd)
             try:
                 digest.update(b".\0dir\n")
-                for relative, _item_info, is_dir in _scandir_tree(item_fd):
+                entries = sorted(_scandir_tree(item_fd), key=lambda entry: entry[0])
+                for relative, _item_info, is_dir in entries:
                     if is_dir:
                         digest.update(relative.encode("utf-8"))
                         digest.update(b"\0dir\n")

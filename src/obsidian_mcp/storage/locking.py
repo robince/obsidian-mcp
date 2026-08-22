@@ -14,10 +14,23 @@ class LockTimeoutError(Exception):
     pass
 
 
+class LockGroup:
+    """Release an ordered group of acquired locks in reverse order."""
+
+    def __init__(self, *locks: FileLock) -> None:
+        self._locks = locks
+
+    def release(self) -> None:
+        for lock in reversed(self._locks):
+            lock.release()
+
+
 # A single stable lock serializes semantic graph scans with cooperating note
 # writers.  The value is only hashed into the lock directory; it is never
 # created in the synced vault.
-SEMANTIC_GRAPH_LOCK = "__semantic_graph__"
+# NUL cannot occur in a canonical vault path, so the global mutation key can
+# never collide with a user-created file or directory lock.
+SEMANTIC_GRAPH_LOCK = "\0obsidian-mcp:mutation-graph"
 
 
 def _default_lock_path() -> tuple[Path | None, bool]:
@@ -66,3 +79,16 @@ def acquire_lock(path: str, timeout: float = 5.0, lock_path: str | Path | None =
     except Timeout as exc:
         raise LockTimeoutError(f"Could not acquire lock for {path!r} within {timeout}s") from exc
     return lock
+
+
+def acquire_mutation_lock(
+    path: str, timeout: float = 5.0, lock_path: str | Path | None = None
+) -> LockGroup:
+    """Acquire the global mutation lock followed by one exact path lock."""
+    graph = acquire_lock(SEMANTIC_GRAPH_LOCK, timeout=timeout, lock_path=lock_path)
+    try:
+        target = acquire_lock(path, timeout=timeout, lock_path=lock_path)
+    except Exception:
+        graph.release()
+        raise
+    return LockGroup(graph, target)

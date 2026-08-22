@@ -8,7 +8,7 @@ from ..config import get_config
 from ..domain.index import VaultIndex
 from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
 # Matches {{variable}} and {{variable:format}}
@@ -78,7 +78,9 @@ def create_from_template(
         return val
 
     rendered = _VAR_RE.sub(_replace, raw_template)
-    lock = acquire_lock(output_path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(
+        output_path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path
+    )
     try:
         revision = storage.write_text_atomic(
             output_path, rendered, expected_revision=intent.expected_revision, create_only=intent.create_only

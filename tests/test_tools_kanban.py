@@ -43,7 +43,7 @@ def test_create_kanban_board_uses_path_lock(vault_factory, monkeypatch):
         events.append(f"acquire:{path}")
         return FakeLock()
 
-    monkeypatch.setattr(kanban_module, "acquire_lock", fake_acquire)
+    monkeypatch.setattr(kanban_module, "acquire_mutation_lock", fake_acquire)
     create_kanban_board("board.md", ["Todo"])
     assert events == ["acquire:board.md", "release"]
 

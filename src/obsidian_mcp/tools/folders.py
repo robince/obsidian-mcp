@@ -8,6 +8,7 @@ from ..config import get_config
 from ..domain.index import VaultIndex
 from ..domain.semantics import ParserVaultSemantics
 from ..storage.filesystem import VaultStorage
+from ..storage.locking import SEMANTIC_GRAPH_LOCK, acquire_lock
 from ..storage.mutations import (
     IndexChange,
     MutationExecutor,
@@ -28,11 +29,18 @@ def create_folder(path: str) -> dict:
     if not path or path in (".", "/", "\\"):
         raise ValueError("A child folder path is required")
     target = storage.resolve_write(path)
-    if storage.exists(target.relative, read=False) and not stat.S_ISDIR(
-        storage.stat(target.relative, read=False).st_mode
-    ):
-        raise ValueError(f"A file already exists at: {path!r}")
-    storage.make_dir(target.relative)
+    cfg = get_config()
+    graph = acquire_lock(
+        SEMANTIC_GRAPH_LOCK, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path
+    )
+    try:
+        if storage.exists(target.relative, read=False) and not stat.S_ISDIR(
+            storage.stat(target.relative, read=False).st_mode
+        ):
+            raise ValueError(f"A file already exists at: {path!r}")
+        storage.make_dir(target.relative)
+    finally:
+        graph.release()
     return {"path": target.relative, "status": "created"}
 
 
@@ -170,8 +178,8 @@ def rename_folder(
     storage = _storage()
     plan = ParserVaultSemantics(storage, index=index).plan_folder_rename(from_path, to_path)
     if plan_only:
-        notes = [change.path for change in plan.index_changes if change.action == "update" and change.path.lower().endswith(".md")]
-        return {**plan.summary(), "status": "planned", "notes_moved": len(notes), "revisions": {item.path.relative: item.original_revision for item in plan.writes}}
+        notes_moved = sum(1 for change in plan.index_changes if change.action == "remove")
+        return {**plan.summary(), "status": "planned", "notes_moved": notes_moved, "revisions": {item.path.relative: item.original_revision for item in plan.writes}}
     if get_config().enable_folder_rename and not approved_digest:
         raise PlanApprovalRequiredError("run the operation in plan mode and approve its plan_digest")
     result = MutationExecutor(storage, index=index).execute(plan, operation_id=operation_id, approved_digest=approved_digest)

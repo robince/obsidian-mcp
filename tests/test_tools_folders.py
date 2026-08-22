@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import obsidian_mcp.config as cfg_mod
+import obsidian_mcp.storage.mutations as mutations_module
 import obsidian_mcp.tools.folders as folders_module
 from obsidian_mcp.tools.folders import (
     create_folder,
@@ -318,7 +319,7 @@ def test_rename_folder_releases_partial_lock_set(vault_factory, monkeypatch):
             return first
         raise RuntimeError("injected lock failure")
 
-    monkeypatch.setattr(folders_module, "acquire_lock", acquire_then_fail)
+    monkeypatch.setattr(mutations_module, "acquire_lock", acquire_then_fail)
     with pytest.raises(RuntimeError, match="injected"):
         rename_folder("Old", "New")
     assert first.released is True

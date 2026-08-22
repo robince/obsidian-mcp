@@ -6,7 +6,7 @@ import uuid
 from ..config import get_config
 from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
-from ..storage.locking import acquire_lock
+from ..storage.locking import acquire_mutation_lock
 from ..storage.policy import InvalidFileTypeError
 from ..storage.revisions import enforce_precondition_policy, revision_result
 
@@ -87,7 +87,7 @@ def write_canvas(
     built_edges = [_normalize_edge(e) for e in (edges or [])]
     data = {"nodes": built_nodes, "edges": built_edges}
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         revision = storage.write_text_atomic(
             path,
@@ -126,7 +126,7 @@ def patch_canvas(
     if not storage.exists(path, read=False):
         raise FileNotFoundError(f"Canvas not found: {path!r}")
 
-    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    lock = acquire_mutation_lock(path, timeout=cfg.mutation_lock_timeout, lock_path=cfg.lock_path)
     try:
         try:
             raw, read_revision = storage.read_text_with_revision(path)
