@@ -28,4 +28,3 @@ topology. Obsidian Sync history is a recovery layer, not the only backup.
 Monitor free space, pending watcher events and conflict records. Keep
 `/data/conflicts` and `/data/operations.sqlite3` in the host backup set; they
 are outside the vault and are needed to investigate failed or retried writes.
-
