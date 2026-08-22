@@ -1008,12 +1008,15 @@ async def health_route(request: Request) -> Response:
     except OSError:
         pending_transactions = [{"status": "recovery_required", "reason": "transaction journal unavailable"}]
     transaction_state = {"incomplete_transactions": len(pending_transactions)}
+    startup_nonce = os.environ.get("LOCAL_SMOKE_TEST_NONCE")
+    nonce_state = {"startup_nonce": startup_nonce} if startup_nonce else {}
     if pending_transactions:
         return JSONResponse(
             {
                 "status": "degraded",
                 "index_ready": _index.is_ready(),
                 **transaction_state,
+                **nonce_state,
                 **(_watcher.health() if _watcher is not None else {}),
             },
             status_code=503,
@@ -1023,6 +1026,7 @@ async def health_route(request: Request) -> Response:
             "status": "ok",
             "index_ready": _index.is_ready(),
             **transaction_state,
+            **nonce_state,
             **(_watcher.health() if _watcher is not None else {}),
         }
     )

@@ -41,6 +41,20 @@ async def test_health_ready_returns_ok(tmp_path, vault_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_echoes_explicit_local_smoke_startup_nonce(vault_factory, monkeypatch):
+    idx = vault_factory({})
+    monkeypatch.setenv("LOCAL_SMOKE_TEST_NONCE", "unique-launch")
+    monkeypatch.setattr(server, "_cfg", server.get_config())
+    monkeypatch.setattr(server, "_index", idx)
+
+    async with _client() as client:
+        resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    assert resp.json()["startup_nonce"] == "unique-launch"
+
+
+@pytest.mark.asyncio
 async def test_health_requires_no_auth(tmp_path, vault_factory, monkeypatch):
     """/health must stay reachable even when API_KEY/OAuth are configured —
     it exposes no vault content, only process liveness."""

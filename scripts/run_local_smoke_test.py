@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -27,7 +29,9 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_health(url: str, process: subprocess.Popen[bytes], timeout: float) -> None:
+def _wait_for_health(
+    url: str, process: subprocess.Popen[bytes], timeout: float, startup_nonce: str
+) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -35,9 +39,10 @@ def _wait_for_health(url: str, process: subprocess.Popen[bytes], timeout: float)
             raise RuntimeError(f"MCP server exited during startup with status {process.returncode}")
         try:
             with urllib.request.urlopen(url, timeout=1) as response:  # noqa: S310
-                if response.status == 200:
+                payload = json.loads(response.read())
+                if response.status == 200 and payload.get("startup_nonce") == startup_nonce:
                     return
-        except (OSError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, urllib.error.URLError) as exc:
             last_error = exc
         time.sleep(0.1)
     raise RuntimeError(f"MCP server did not become healthy: {last_error}")
@@ -74,6 +79,8 @@ def run(args: argparse.Namespace) -> int:
         path.mkdir(parents=True, exist_ok=True)
 
     port = args.port or _free_port()
+    api_key = args.api_key or secrets.token_urlsafe(32)
+    startup_nonce = secrets.token_urlsafe(32)
     base_url = f"http://127.0.0.1:{port}"
     log_path = root / "server.log"
     environment = os.environ.copy()
@@ -83,8 +90,10 @@ def run(args: argparse.Namespace) -> int:
             "TRANSPORT": "http",
             "HOST": "127.0.0.1",
             "PORT": str(port),
-            "API_KEY": args.api_key,
-            "WRITE_PATHS": "AI-Memory",
+            "API_KEY": api_key,
+            "OBSIDIAN_MCP_API_KEY": api_key,
+            "LOCAL_SMOKE_TEST_NONCE": startup_nonce,
+            "WRITE_PATHS": "AI-Memory/",
             "DENY_READ_PATHS": ".obsidian/,.trash/",
             "DENY_WRITE_PATHS": ".obsidian/,.trash/,_AI_INSTRUCTIONS.md",
             "LOCK_PATH": str(data / "locks"),
@@ -108,19 +117,22 @@ def run(args: argparse.Namespace) -> int:
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
-            _wait_for_health(f"{base_url}/health", process, args.startup_timeout)
+            _wait_for_health(
+                f"{base_url}/health", process, args.startup_timeout, startup_nonce
+            )
             completed = subprocess.run(
                 [
-                    sys.executable,
+                    str(SERVER.with_name("python")),
                     str(CLIENT),
                     "--url",
                     f"{base_url}/mcp",
-                    "--api-key",
-                    args.api_key,
+                    "--denied-note",
+                    "outside-write-scope.md",
                     "--vault-path",
                     str(vault),
                 ],
                 cwd=REPO_ROOT,
+                env=environment,
                 check=False,
             )
             succeeded = completed.returncode == 0
@@ -138,7 +150,7 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--api-key", default="local-smoke-secret")
+    parser.add_argument("--api-key", help="Local disposable server key; default is random")
     parser.add_argument("--port", type=int, help="Fixed port; default chooses a free port")
     parser.add_argument("--startup-timeout", type=float, default=15)
     parser.add_argument("--keep", action="store_true", help="Keep the disposable vault and log")

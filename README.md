@@ -120,8 +120,9 @@ at all.
 
 The high-impact mutation groups are similarly opt-in: set `ENABLE_MOVE`,
 `ENABLE_FOLDER_RENAME`, `ENABLE_FOLDER_RESTORE`, `ENABLE_BULK_REPLACE`, or `ENABLE_DELETE` to register
-the corresponding tools. Their underlying Python functions remain available
-for local/unit-test use and future transactional implementations.
+the corresponding tools. Folder restore and the other multi-file operations
+listed above use the transaction layer; their underlying Python functions also
+remain available for local and unit-test use.
 
 ## Usage with Claude Code
 
@@ -416,7 +417,11 @@ updates it using that revision, verifies the bytes on disk, and confirms that
 a write outside `WRITE_PATHS` is denied. A successful run prints JSON with
 `"status": "ok"`. Pass `--keep` to retain the disposable vault and server log
 for inspection, or use `smoke_test_mcp.py` directly to test an already-running
-local, containerized, or remote server.
+local, containerized, or remote server. The standalone client reads its key
+from `OBSIDIAN_MCP_API_KEY` (or prompts securely when it is unset), so the key
+does not need to appear in command history or process arguments. Its denied
+write probe is opt-in via `--denied-note PATH`; only provide a path you know is
+outside that server's configured write scope.
 
 ## License
 

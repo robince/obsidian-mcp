@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from fastmcp import Client
 
+CREATED_CONTENT = "# MCP smoke test\n\ncreated over real HTTP\n"
+UPDATED_CONTENT = "# MCP smoke test\n\nupdated with revision precondition\n"
+EXPECTED_READ_CONTENT = "# MCP smoke test\n\nupdated with revision precondition"
 
-def _structured(result: Any) -> Any:
-    if result.is_error:
-        text = "\n".join(getattr(item, "text", repr(item)) for item in result.content)
-        raise RuntimeError(text)
+
+def _result_value(result: Any) -> Any:
     if result.data is not None:
         return result.data
     if result.structured_content is not None:
@@ -25,6 +28,23 @@ def _structured(result: Any) -> Any:
     if len(result.content) == 1 and hasattr(result.content[0], "text"):
         return json.loads(result.content[0].text)
     raise RuntimeError(f"Unexpected MCP response: {result!r}")
+
+
+def _structured(result: Any) -> Any:
+    if result.is_error:
+        text = "\n".join(getattr(item, "text", repr(item)) for item in result.content)
+        raise RuntimeError(text)
+    return _result_value(result)
+
+
+def _require_rejection(result: Any, description: str) -> str:
+    text = "\n".join(getattr(item, "text", repr(item)) for item in result.content)
+    if result.is_error:
+        return text
+    value = _result_value(result)
+    if isinstance(value, dict) and value.get("error"):
+        return json.dumps(value, sort_keys=True)
+    raise RuntimeError(f"{description} unexpectedly succeeded: {result!r}")
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -40,7 +60,7 @@ async def run(args: argparse.Namespace) -> None:
                 "write_note_tool",
                 {
                     "path": args.note,
-                    "content": "# MCP smoke test\n\ncreated over real HTTP\n",
+                    "content": CREATED_CONTENT,
                     "create_only": True,
                 },
             )
@@ -57,39 +77,56 @@ async def run(args: argparse.Namespace) -> None:
                 "write_note_tool",
                 {
                     "path": args.note,
-                    "content": "# MCP smoke test\n\nupdated with revision precondition\n",
+                    "content": UPDATED_CONTENT,
                     "expected_revision": revision,
                 },
             )
         )
-        final_read = _structured(
-            await client.call_tool("read_note_tool", {"path": args.note})
+        duplicate_create = await client.call_tool(
+            "write_note_tool",
+            {"path": args.note, "content": "must not replace\n", "create_only": True},
+            raise_on_error=False,
         )
-        if "updated with revision precondition" not in final_read.get("content", ""):
-            raise RuntimeError("Updated content was not returned by read_note_tool")
+        _require_rejection(duplicate_create, "Repeated create_only write")
 
-        denied_result = await client.call_tool(
+        stale_update = await client.call_tool(
             "write_note_tool",
             {
-                "path": args.denied_note,
-                "content": "this must not be written\n",
-                "create_only": True,
+                "path": args.note,
+                "content": "must not replace\n",
+                "expected_revision": revision,
             },
             raise_on_error=False,
         )
-        denied_text = "\n".join(
-            getattr(item, "text", repr(item)) for item in denied_result.content
+        _require_rejection(stale_update, "Stale expected_revision write")
+
+        final_read = _structured(
+            await client.call_tool("read_note_tool", {"path": args.note})
         )
-        if not denied_result.is_error or "denied" not in denied_text.lower():
-            raise RuntimeError(f"Expected a denied write, got: {denied_result!r}")
+        if final_read.get("content") != EXPECTED_READ_CONTENT:
+            raise RuntimeError("Rejected precondition changed the successfully updated content")
+
+        denied_write = "not_requested"
+        if args.denied_note:
+            denied_result = await client.call_tool(
+                "write_note_tool",
+                {
+                    "path": args.denied_note,
+                    "content": "this must not be written\n",
+                    "create_only": True,
+                },
+                raise_on_error=False,
+            )
+            denied_text = _require_rejection(denied_result, "Denied write")
+            if "denied" not in denied_text.lower():
+                raise RuntimeError(f"Expected a denied write, got: {denied_result!r}")
+            denied_write = "access_denied"
 
         if args.vault_path:
             disk_path = args.vault_path / args.note
-            disk_content = disk_path.read_text(encoding="utf-8").rstrip("\n")
-            returned_content = final_read["content"].rstrip("\n")
-            if disk_content != returned_content:
+            if disk_path.read_bytes() != UPDATED_CONTENT.encode("utf-8"):
                 raise RuntimeError(f"On-disk content differs at {disk_path}")
-            if (args.vault_path / args.denied_note).exists():
+            if args.denied_note and (args.vault_path / args.denied_note).exists():
                 raise RuntimeError("Denied note was unexpectedly created on disk")
 
         print(
@@ -99,7 +136,8 @@ async def run(args: argparse.Namespace) -> None:
                     "tools_advertised": len(tools),
                     "created_revision": created.get("revision"),
                     "updated_revision": updated.get("revision"),
-                    "denied_write": "access_denied",
+                    "denied_write": denied_write,
+                    "preconditions_rejected": True,
                     "note": args.note,
                 },
                 indent=2,
@@ -111,11 +149,16 @@ async def run(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8000/mcp")
-    parser.add_argument("--api-key", required=True)
     parser.add_argument("--note")
-    parser.add_argument("--denied-note", default="outside-write-scope.md")
+    parser.add_argument(
+        "--denied-note",
+        help="Optional caller-supplied path known to be outside the server write scope",
+    )
     parser.add_argument("--vault-path", type=Path)
     args = parser.parse_args()
+    args.api_key = os.environ.get("OBSIDIAN_MCP_API_KEY")
+    if not args.api_key:
+        args.api_key = getpass.getpass("Obsidian MCP API key: ")
     args.note = args.note or f"AI-Memory/mcp-smoke-test-{uuid4().hex}.md"
     asyncio.run(run(args))
 
