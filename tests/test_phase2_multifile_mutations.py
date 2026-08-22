@@ -92,6 +92,32 @@ def test_executor_rejects_unplanned_missing_parent(vault_factory):
         MutationExecutor(storage).execute(plan)
 
 
+def test_executor_rejects_tampered_staged_artifact(tmp_path, vault_factory, monkeypatch):
+    vault_factory({"note.md": "before"})
+    storage = VaultStorage.from_config()
+    plan = MutationPlan(
+        operation="staging-integrity",
+        writes=(
+            PlannedWrite(
+                storage.resolve_write("note.md"),
+                storage.revision("note.md").token,
+                b"approved",
+            ),
+        ),
+    )
+    executor = MutationExecutor(storage)
+    original_stage = executor._stage
+
+    def tamper_after_staging(journal, staged_plan):
+        original_stage(journal, staged_plan)
+        (journal.stage_dir / "000000.bin").write_bytes(b"tampered")
+
+    monkeypatch.setattr(executor, "_stage", tamper_after_staging)
+    with pytest.raises(MutationPreconditionError, match="does not match approved plan"):
+        executor.execute(plan)
+    assert (tmp_path / "note.md").read_text() == "before"
+
+
 def test_move_rejects_protected_backlink_before_mutating(tmp_path, vault_factory, monkeypatch):
     vault_factory({"Allowed/old.md": "body", "outside.md": "[[Allowed/old]]"})
     _enable(monkeypatch, ENABLE_MOVE=True, WRITE_PATHS="Allowed/")

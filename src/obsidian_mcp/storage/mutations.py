@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import stat
 import tempfile
 import uuid
@@ -646,7 +647,12 @@ class MutationExecutor:
             staged.write_bytes(item.content)
             staged.chmod(0o600)
             _fsync_file(staged)
-            journal.step("staged", path=self._path(item.path), staged=staged.name)
+            journal.step(
+                "staged",
+                path=self._path(item.path),
+                staged=staged.name,
+                content_digest=item.content_digest,
+            )
         _fsync_dir_path(journal.stage_dir)
 
     @staticmethod
@@ -710,11 +716,13 @@ class MutationExecutor:
             if current is not None and current.token == original:
                 return "pre"
             staged = journal.stage_dir / str(step.get("staged", ""))
+            expected_digest = step.get("content_digest")
             if (
                 staged.is_file()
                 and not staged.is_symlink()
                 and current is not None
-                and current.sha256 == hashlib.sha256(staged.read_bytes()).hexdigest()
+                and current.sha256
+                == (expected_digest or hashlib.sha256(staged.read_bytes()).hexdigest())
             ):
                 return "post"
             return "unknown"
@@ -1073,6 +1081,19 @@ class MutationExecutor:
                     planned_path = self._path(item.path)
                     path = mapped_write_path(planned_path)
                     write_index = write_indexes[planned_path]
+                    staged_name = f"{write_index:06d}.bin"
+                    staged = journal.stage_dir / staged_name
+                    if not staged.is_file() or staged.is_symlink():
+                        raise MutationPreconditionError(
+                            f"staged artifact is missing or invalid for {planned_path!r}"
+                        )
+                    staged_content = staged.read_bytes()
+                    if not secrets.compare_digest(
+                        hashlib.sha256(staged_content).hexdigest(), item.content_digest
+                    ):
+                        raise MutationPreconditionError(
+                            f"staged artifact does not match approved plan for {planned_path!r}"
+                        )
                     intent_id = f"write:{write_index}"
                     journal.step(
                         "intent",
@@ -1080,10 +1101,11 @@ class MutationExecutor:
                         intent_id=intent_id,
                         path=path,
                         planned_path=planned_path,
-                        staged=f"{write_index:06d}.bin",
+                        staged=staged_name,
+                        content_digest=item.content_digest,
                         original_revision=item.original_revision,
                     )
-                    self.storage.write_bytes_atomic(path, item.content, expected_revision=item.original_revision, create_only=item.original_revision is None)
+                    self.storage.write_bytes_atomic(path, staged_content, expected_revision=item.original_revision, create_only=item.original_revision is None)
                     post = _revision(self.storage, path)
                     if post is None:
                         raise MutationRecoveryRequiredError(f"write post-state is missing for {path!r}")
@@ -1093,7 +1115,8 @@ class MutationExecutor:
                         intent_id=intent_id,
                         path=path,
                         planned_path=planned_path,
-                        staged=f"{write_index:06d}.bin",
+                        staged=staged_name,
+                        content_digest=item.content_digest,
                         post_revision=post.token,
                     )
                     rewritten.append(planned_path)
@@ -1365,7 +1388,10 @@ def _recover_transaction_unlocked(
             if intent.get("action") == "write" and intent.get("_attributable_post"):
                 staged = directory / "stage" / str(intent.get("staged", ""))
                 write_step = dict(intent)
-                write_step["post_revision"] = "sha256:" + hashlib.sha256(staged.read_bytes()).hexdigest()
+                content_digest = intent.get("content_digest")
+                if not content_digest:
+                    content_digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+                write_step["post_revision"] = "sha256:" + content_digest
                 write_steps.append(write_step)
         moves = [step for step in applied if executor._step_action(step) == "move"]
         moves.extend(
@@ -1410,7 +1436,10 @@ def _recover_transaction_unlocked(
                     raise MutationRecoveryRequiredError("write post-state is missing")
                 if expected and current.token != expected:
                     raise MutationRecoveryRequiredError("write post-state changed")
-                if not expected and current.sha256 != hashlib.sha256(staged.read_bytes()).hexdigest():
+                expected_digest = step.get("content_digest")
+                if not expected and current.sha256 != (
+                    expected_digest or hashlib.sha256(staged.read_bytes()).hexdigest()
+                ):
                     raise MutationRecoveryRequiredError("write post-state changed")
             elif action == "move":
                 source, destination = step.get("source"), step.get("destination")
