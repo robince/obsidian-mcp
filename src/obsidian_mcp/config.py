@@ -31,6 +31,16 @@ class Config:
     deny_read_paths: list[str]
     deny_write_paths: list[str]
     lock_path: Path
+    operation_ledger_path: Path
+    conflict_path: Path | None
+    store_conflict_content: bool
+    require_write_preconditions: bool
+    allow_blind_create: bool
+    allow_blind_overwrite: bool
+    operation_retention_seconds: int
+    index_reconcile_interval: float
+    watcher_debounce_ms: int
+    watcher_max_pending_events: int
     allow_permanent_delete: bool
     max_attachment_bytes: int
     transport: str
@@ -47,6 +57,7 @@ class Config:
     enable_bases: bool
     enable_move: bool
     enable_folder_rename: bool
+    enable_folder_restore: bool
     enable_bulk_replace: bool
     enable_delete: bool
 
@@ -100,6 +111,45 @@ class Config:
         if self.lock_path == self.vault_path or self.vault_path in self.lock_path.parents:
             raise ConfigError("LOCK_PATH must be outside VAULT_PATH")
 
+        raw_ledger = os.environ.get("OPERATION_LEDGER_PATH", "")
+        self.operation_ledger_path = (
+            Path(raw_ledger).expanduser().resolve()
+            if raw_ledger
+            else self.lock_path.parent / "operations.sqlite3"
+        )
+        if self.operation_ledger_path == self.vault_path or self.vault_path in self.operation_ledger_path.parents:
+            raise ConfigError("OPERATION_LEDGER_PATH must be outside VAULT_PATH")
+        raw_conflicts = os.environ.get("CONFLICT_PATH", "")
+        self.conflict_path = Path(raw_conflicts).expanduser().resolve() if raw_conflicts else None
+        if self.conflict_path and (
+            self.conflict_path == self.vault_path or self.vault_path in self.conflict_path.parents
+        ):
+            raise ConfigError("CONFLICT_PATH must be outside VAULT_PATH")
+        self.store_conflict_content = os.environ.get("STORE_CONFLICT_CONTENT", "false").lower() in (
+            "1", "true", "yes"
+        )
+
+        self.require_write_preconditions = os.environ.get(
+            "REQUIRE_WRITE_PRECONDITIONS", "false"
+        ).lower() in ("1", "true", "yes")
+        self.allow_blind_create = os.environ.get("ALLOW_BLIND_CREATE", "true").lower() in (
+            "1", "true", "yes"
+        )
+        # Keep existing installations compatible until REQUIRE_* is enabled;
+        # operators can explicitly set this false for a create-only rollout.
+        self.allow_blind_overwrite = os.environ.get("ALLOW_BLIND_OVERWRITE", "true").lower() in (
+            "1", "true", "yes"
+        )
+        try:
+            self.operation_retention_seconds = int(os.environ.get("OPERATION_RETENTION_SECONDS", "604800"))
+            self.index_reconcile_interval = float(os.environ.get("INDEX_RECONCILE_INTERVAL", "300"))
+            self.watcher_debounce_ms = int(os.environ.get("WATCHER_DEBOUNCE_MS", "100"))
+            self.watcher_max_pending_events = int(os.environ.get("WATCHER_MAX_PENDING_EVENTS", "10000"))
+        except ValueError as exc:
+            raise ConfigError("Operation retention, reconciliation and debounce settings must be numeric") from exc
+        if self.operation_retention_seconds <= 0 or self.index_reconcile_interval <= 0 or self.watcher_debounce_ms < 0 or self.watcher_max_pending_events <= 0:
+            raise ConfigError("Operation retention, reconciliation and watcher queue size must be positive; debounce cannot be negative")
+
         self.allow_permanent_delete = os.environ.get(
             "ALLOW_PERMANENT_DELETE", "false"
         ).lower() in ("1", "true", "yes")
@@ -118,6 +168,7 @@ class Config:
         self.enable_bases = os.environ.get("ENABLE_BASES", "false").lower() in ("1", "true", "yes")
         self.enable_move = os.environ.get("ENABLE_MOVE", "false").lower() in ("1", "true", "yes")
         self.enable_folder_rename = os.environ.get("ENABLE_FOLDER_RENAME", "false").lower() in ("1", "true", "yes")
+        self.enable_folder_restore = os.environ.get("ENABLE_FOLDER_RESTORE", "false").lower() in ("1", "true", "yes")
         self.enable_bulk_replace = os.environ.get("ENABLE_BULK_REPLACE", "false").lower() in ("1", "true", "yes")
         self.enable_delete = os.environ.get("ENABLE_DELETE", "false").lower() in ("1", "true", "yes")
 

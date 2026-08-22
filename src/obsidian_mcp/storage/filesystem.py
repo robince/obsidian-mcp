@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..domain.models import FileRevision, RevisionConflictError
 from .policy import (
     ProtectedPathError,
     ReadPermissionError,
@@ -84,6 +85,8 @@ def _require_secure_platform() -> None:
         raise SecureStorageError("renameat-style directory descriptors are unavailable")
     if os.unlink not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd:
         raise SecureStorageError("unlinkat/mkdirat-style directory descriptors are unavailable")
+    if not hasattr(os, "link") or os.link not in os.supports_dir_fd:
+        raise SecureStorageError("linkat-style no-replace commits are unavailable")
 
 
 def _dir_flags() -> int:
@@ -158,6 +161,31 @@ def _write_all(fd: int, data: bytes) -> None:
         if written <= 0:
             raise OSError("short write")
         view = view[written:]
+
+
+def _fsync_dir(fd: int) -> None:
+    """Persist a directory entry update before reporting a mutation done."""
+    os.fsync(fd)
+
+
+def _revision_at(parent_fd: int, leaf: str) -> FileRevision:
+    """Hash one regular file through the already-authorized parent fd."""
+    fd = os.open(leaf, _file_flags(), dir_fd=parent_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise IsADirectoryError(leaf)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        final = os.fstat(fd)
+        return FileRevision.from_bytes(content, size=len(content), mtime_ns=final.st_mtime_ns)
+    finally:
+        os.close(fd)
 
 
 def _scandir_tree(fd: int, prefix: str = "") -> Iterator[tuple[str, os.stat_result, bool]]:
@@ -315,6 +343,42 @@ class VaultStorage:
                 self.policy.resolve_write(mapped)
         return source_paths
 
+    def _read_fd(self, path: str) -> tuple[bytes, FileRevision]:
+        target = self.resolve_read(path)
+        with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
+            fd = os.open(leaf, _file_flags(), dir_fd=parent_fd)
+            try:
+                before = os.fstat(fd)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                after = os.fstat(fd)
+                # If a cooperating or external writer changed the file while
+                # it was read, use the final metadata for diagnostics but the
+                # hash remains authoritative for the exact bytes returned.
+                info = after if after.st_size == len(content) else before
+                return content, FileRevision.from_bytes(
+                    content, size=len(content), mtime_ns=info.st_mtime_ns
+                )
+            finally:
+                os.close(fd)
+
+    def revision(self, path: str) -> FileRevision:
+        """Return the authoritative SHA-256 revision of an authorized file."""
+        _, revision = self._read_fd(path)
+        return revision
+
+    def read_text_with_revision(self, path: str) -> tuple[str, FileRevision]:
+        content, revision = self._read_fd(path)
+        return content.decode("utf-8", "replace"), revision
+
+    def read_bytes_with_revision(self, path: str) -> tuple[bytes, FileRevision]:
+        return self._read_fd(path)
+
     def read_text(self, path: str) -> str:
         target = self.resolve_read(path)
         with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
@@ -342,7 +406,30 @@ class VaultStorage:
             finally:
                 os.close(fd)
 
-    def _write_atomic(self, target: VaultPath, data: bytes) -> None:
+    def _current_revision(self, target: VaultPath) -> FileRevision | None:
+        try:
+            return self.revision(target.relative)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _matches_revision(actual: FileRevision | None, expected: FileRevision) -> bool:
+        return actual is not None and actual.sha256 == expected.sha256
+
+    def _write_atomic(
+        self,
+        target: VaultPath,
+        data: bytes,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+        create_only: bool = False,
+    ) -> FileRevision:
+        expected = FileRevision.from_value(expected_revision) if expected_revision is not None else None
+        before = self._current_revision(target)
+        if create_only and before is not None:
+            raise RevisionConflictError(target.relative, None, before)
+        if expected is not None and not self._matches_revision(before, expected):
+            raise RevisionConflictError(target.relative, expected, before)
         tmp_name = f".obsidian-mcp-tmp-{uuid.uuid4().hex}"
         with _opened_parent(self.policy.root, target.relative, create=True) as (parent_fd, leaf):
             # O_EXCL + dirfd ensures the temporary file is created in the
@@ -359,7 +446,42 @@ class VaultStorage:
                 os.fsync(tmp_fd)
                 os.close(tmp_fd)
                 tmp_fd = -1
-                os.rename(tmp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                # Re-check immediately before replacement. This catches a
+                # sync writer that changed the file while the temporary file
+                # was being staged. The final rename remains the unavoidable
+                # small race described in the Phase 3 design.
+                current = self._current_revision(target)
+                if create_only:
+                    if current is not None:
+                        raise RevisionConflictError(target.relative, None, current)
+                elif expected is not None:
+                    if not self._matches_revision(current, expected):
+                        raise RevisionConflictError(target.relative, expected, current)
+                elif before is not None and current is not None and current.sha256 != before.sha256:
+                    raise RevisionConflictError(target.relative, before, current)
+                elif before is None and current is not None:
+                    raise RevisionConflictError(target.relative, None, current)
+                if create_only:
+                    # link(2) is the portable same-directory no-replace
+                    # primitive available here: it fails atomically with
+                    # EEXIST if another writer created the destination after
+                    # the final check. The temporary name is then removed.
+                    try:
+                        os.link(
+                            tmp_name,
+                            leaf,
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        actual = self._current_revision(target)
+                        raise RevisionConflictError(target.relative, None, actual) from None
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+                    _fsync_dir(parent_fd)
+                else:
+                    os.rename(tmp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    _fsync_dir(parent_fd)
                 committed = True
             finally:
                 if tmp_fd >= 0:
@@ -367,14 +489,33 @@ class VaultStorage:
                 if not committed:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(tmp_name, dir_fd=parent_fd)
+        return self.revision(target.relative)
 
-    def write_text_atomic(self, path: str, content: str) -> None:
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+        create_only: bool = False,
+    ) -> FileRevision:
         target = self.resolve_write(path)
-        self._write_atomic(target, content.encode("utf-8"))
+        return self._write_atomic(
+            target, content.encode("utf-8"), expected_revision=expected_revision, create_only=create_only
+        )
 
-    def write_bytes_atomic(self, path: str, content: bytes) -> None:
+    def write_bytes_atomic(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+        create_only: bool = False,
+    ) -> FileRevision:
         target = self.resolve_write(path)
-        self._write_atomic(target, content)
+        return self._write_atomic(
+            target, content, expected_revision=expected_revision, create_only=create_only
+        )
 
     def make_dir(self, path: str) -> VaultPath:
         target = self.resolve_write(path)
@@ -471,17 +612,34 @@ class VaultStorage:
         self._rename_relative(source, destination)
         return source, destination
 
-    def delete(self, path: str, *, permanent: bool = False) -> VaultPath:
+    def delete(
+        self,
+        path: str,
+        *,
+        permanent: bool = False,
+        expected_revision: FileRevision | str | dict | None = None,
+    ) -> VaultPath:
         target = self.resolve_delete(path, permanent=permanent)
         self.authorize_tree(target.relative, permanent=permanent)
         with _opened_parent(self.policy.root, target.relative) as (parent_fd, leaf):
+            if expected_revision is not None:
+                actual = _revision_at(parent_fd, leaf)
+                expected = FileRevision.from_value(expected_revision)
+                if actual.sha256 != expected.sha256:
+                    raise RevisionConflictError(target.relative, expected, actual)
             if permanent:
                 _remove_tree_fd(parent_fd, leaf)
+                _fsync_dir(parent_fd)
             else:
                 raise IsADirectoryError(f"Use trash() for a folder: {path!r}")
         return target
 
-    def trash(self, path: str) -> tuple[VaultPath, Path]:
+    def trash(
+        self,
+        path: str,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+    ) -> tuple[VaultPath, Path]:
         source = self.resolve_delete(path)
         self.authorize_tree(source.relative)
         with _opened_dir(self.policy.root, "") as root_fd:
@@ -495,6 +653,11 @@ class VaultStorage:
                     raise ProtectedPathError("The vault trash directory cannot be a symlink")
                 with _opened_parent(self.policy.root, source.relative) as (src_parent, src_leaf):
                     _ensure_not_symlink(src_parent, src_leaf)
+                    if expected_revision is not None:
+                        actual = _revision_at(src_parent, src_leaf)
+                        expected = FileRevision.from_value(expected_revision)
+                        if actual.sha256 != expected.sha256:
+                            raise RevisionConflictError(source.relative, expected, actual)
                     destination_name = source.relative.rsplit("/", 1)[-1]
                     try:
                         _stat_at(trash_fd, destination_name)
@@ -506,6 +669,8 @@ class VaultStorage:
                             stem, suffix = destination_name, ""
                         destination_name = f"{stem}-{uuid.uuid4().hex[:8]}{('.' + suffix) if suffix else ''}"
                     os.rename(src_leaf, destination_name, src_dir_fd=src_parent, dst_dir_fd=trash_fd)
+                    _fsync_dir(src_parent)
+                    _fsync_dir(trash_fd)
                     return source, self.policy.root / ".trash" / destination_name
             finally:
                 os.close(trash_fd)
@@ -543,7 +708,13 @@ class VaultStorage:
                 mtime=info.st_mtime,
             )
 
-    def restore(self, trashed_name: str, to_path: str) -> VaultPath:
+    def restore(
+        self,
+        trashed_name: str,
+        to_path: str,
+        *,
+        expected_revision: FileRevision | str | dict | None = None,
+    ) -> VaultPath:
         info = self.trash_info(trashed_name)
         destination = self.resolve_write(to_path)
         if info.is_dir:
@@ -572,14 +743,60 @@ class VaultStorage:
             _opened_dir(self.policy.root, ".trash") as trash_fd,
             _opened_parent(self.policy.root, destination.relative, create=True) as (dst_parent, dst_leaf),
         ):
+            _ensure_not_symlink(trash_fd, info.name)
+            if info.is_dir:
+                # Folder restore is a multi-file operation and retains the
+                # rename path until the Phase 2 transaction layer exists.
                 try:
                     _stat_at(dst_parent, dst_leaf)
                 except FileNotFoundError:
                     pass
                 else:
                     raise FileExistsError(f"Target already exists: {to_path!r}")
-                _ensure_not_symlink(trash_fd, info.name)
                 os.rename(info.name, dst_leaf, src_dir_fd=trash_fd, dst_dir_fd=dst_parent)
+                _fsync_dir(trash_fd)
+                _fsync_dir(dst_parent)
+            else:
+                source_revision = _revision_at(trash_fd, info.name)
+                if expected_revision is not None:
+                    expected = FileRevision.from_value(expected_revision)
+                    if source_revision.sha256 != expected.sha256:
+                        raise RevisionConflictError(trashed_name, expected, source_revision)
+                try:
+                    _stat_at(dst_parent, dst_leaf)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise FileExistsError(f"Target already exists: {to_path!r}")
+                try:
+                    # Same-directory linkat-style commit gives restore true
+                    # no-replace semantics. Only after the destination is
+                    # verified do we unlink the source in .trash.
+                    os.link(
+                        info.name,
+                        dst_leaf,
+                        src_dir_fd=trash_fd,
+                        dst_dir_fd=dst_parent,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    actual = self._current_revision(destination)
+                    raise RevisionConflictError(destination.relative, None, actual) from None
+                try:
+                    final_revision = _revision_at(dst_parent, dst_leaf)
+                    if final_revision.sha256 != source_revision.sha256:
+                        raise RevisionConflictError(destination.relative, source_revision, final_revision)
+                    current_source = _revision_at(trash_fd, info.name)
+                    if current_source.sha256 != source_revision.sha256:
+                        raise RevisionConflictError(trashed_name, source_revision, current_source)
+                    _fsync_dir(dst_parent)
+                    os.unlink(info.name, dir_fd=trash_fd)
+                    _fsync_dir(trash_fd)
+                except Exception:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(dst_leaf, dir_fd=dst_parent)
+                    _fsync_dir(dst_parent)
+                    raise
         return destination
 
 

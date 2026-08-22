@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 import obsidian_mcp.tools.write as write_module
+from obsidian_mcp.storage.filesystem import VaultStorage
 from obsidian_mcp.tools.write import (
     WritePermissionError,
     append_to_note,
@@ -217,6 +218,14 @@ def test_restore_note_to_different_path(tmp_path, vault_factory):
     delete_note("note.md", trash=True)
     restore_note("note.md", "restored/note.md")
     assert (tmp_path / "restored" / "note.md").read_text() == "content"
+
+
+def test_restore_note_returns_revision_and_checks_source_revision(vault_factory):
+    vault_factory({"note.md": "content"})
+    original = VaultStorage.from_config().revision("note.md")
+    delete_note("note.md", trash=True)
+    result = restore_note("note.md", "note.md", expected_revision=original)
+    assert result["revision"]["sha256"] == original.sha256
 
 
 def test_restore_note_updates_index(vault_factory):

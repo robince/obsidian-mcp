@@ -70,6 +70,13 @@ VAULT_PATH=/path/to/your/obsidian/vault
 # DENY_READ_PATHS=.obsidian/,.trash/ # security boundary for all reads
 # DENY_WRITE_PATHS=.obsidian/,.trash/,_AI_INSTRUCTIONS.md
 # ALLOW_PERMANENT_DELETE=false
+# REQUIRE_WRITE_PRECONDITIONS=false # set true before enabling automated overwrites
+# ALLOW_BLIND_CREATE=true
+# ALLOW_BLIND_OVERWRITE=true        # set false for create-only rollout
+# OPERATION_LEDGER_PATH=/data/operations.sqlite3
+# CONFLICT_PATH=/data/conflicts   # optional proposed-content staging outside vault
+# STORE_CONFLICT_CONTENT=false    # keep conflict records metadata-only by default
+# INDEX_RECONCILE_INTERVAL=300
 # TRANSPORT=stdio           # stdio (default), http (recommended for network use), or sse (legacy)
 ```
 
@@ -102,6 +109,7 @@ for the two auth variants in detail.
 # High-impact mutations are absent from the MCP tool list unless enabled.
 # ENABLE_MOVE=true             # move_note_tool
 # ENABLE_FOLDER_RENAME=true    # rename_folder_tool
+# ENABLE_FOLDER_RESTORE=true   # restore_folder_tool (deferred multi-file Phase 2)
 # ENABLE_BULK_REPLACE=true     # find_replace_in_vault_tool
 # ENABLE_DELETE=true           # delete_note_tool and delete_folder_tool
 ```
@@ -111,7 +119,7 @@ call time — they're never registered, so they don't appear in the tool list
 at all.
 
 The high-impact mutation groups are similarly opt-in: set `ENABLE_MOVE`,
-`ENABLE_FOLDER_RENAME`, `ENABLE_BULK_REPLACE`, or `ENABLE_DELETE` to register
+`ENABLE_FOLDER_RENAME`, `ENABLE_FOLDER_RESTORE`, `ENABLE_BULK_REPLACE`, or `ENABLE_DELETE` to register
 the corresponding tools. Their underlying Python functions remain available
 for local/unit-test use and future transactional implementations.
 
@@ -197,6 +205,16 @@ Folder/note trash and restore are intentionally unavailable in this nested-bind
 profile: moving from a writable overlay into the read-only parent vault's
 `.trash` would cross mounts. Keep `ENABLE_DELETE=false` (hard-coded here) and
 do not enable folder restore in this topology.
+
+For continuous Headless Sync, use the revision returned by every read as the
+`expected_revision` on an overwrite, patch or delete. Set
+`REQUIRE_WRITE_PRECONDITIONS=true` and `ALLOW_BLIND_OVERWRITE=false` before
+production writes. `append_to_note` accepts an `operation_id` and stores only
+its metadata/result revision in `/data/operations.sqlite3`, so remote retries
+do not duplicate an event. Attachment HTTP clients use the same contract with
+`ETag`, `If-Match` and `If-None-Match: *`; stale writes return HTTP 412 and a
+missing required condition returns HTTP 428. See the [backup and restore
+drill](docs/deployment/backup-restore.md) before enabling writes.
 
 The static Compose checks are covered by the test suite. A real deployment
 test (Docker mount precedence, host UID/GID permissions, and the Cloudflare

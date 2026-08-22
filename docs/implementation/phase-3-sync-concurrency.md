@@ -2,8 +2,10 @@
 
 ## Status
 
-Proposed implementation plan. Depends on Phase 1 and uses Phase 2's revision and
-mutation-plan concepts.
+Implemented on the Phase 3 branch; residuals are recorded in
+`phase-3-implementation-notes.md`. Depends on Phase 1 and defines the minimal
+revision/precondition interfaces that Phase 2 can consume; Phase 2's
+multi-file transaction machinery is not implemented here.
 
 ## Objective
 
@@ -208,8 +210,8 @@ When a revision conflict occurs:
 - expose an operator command to inspect or discard staged conflict content;
 - never put secrets or denied source content into a conflict record.
 
-For multi-file operations, use Phase 2 transaction recovery and disable them by
-default when continuous external sync is active.
+For multi-file operations, keep the Phase 2 transaction-recovery integration
+and feature gates disabled by default when continuous external sync is active.
 
 ## Watcher and index consistency
 

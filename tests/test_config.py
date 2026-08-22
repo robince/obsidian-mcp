@@ -92,6 +92,7 @@ def test_security_path_defaults_and_lock_outside_vault(tmp_path, monkeypatch):
     assert tmp_path not in cfg.lock_path.parents
     assert cfg.enable_move is False
     assert cfg.enable_folder_rename is False
+    assert cfg.enable_folder_restore is False
     assert cfg.enable_bulk_replace is False
     assert cfg.enable_delete is False
 

@@ -23,6 +23,9 @@ def test_home_server_compose_has_read_only_vault_and_nested_write_overlays():
     for flag in ("ENABLE_MOVE", "ENABLE_FOLDER_RENAME", "ENABLE_BULK_REPLACE"):
         assert service["environment"][flag] == "${" + flag + ":-false}"
     assert service["environment"]["ENABLE_DELETE"] == "false"
+    assert service["environment"]["ENABLE_FOLDER_RESTORE"] == "false"
+    assert service["environment"]["REQUIRE_WRITE_PRECONDITIONS"] == "${REQUIRE_WRITE_PRECONDITIONS:-true}"
+    assert service["environment"]["ALLOW_BLIND_OVERWRITE"] == "${ALLOW_BLIND_OVERWRITE:-false}"
 
 
 def test_home_server_compose_uses_private_tunnel_network():

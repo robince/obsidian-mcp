@@ -4,9 +4,11 @@ import json
 import uuid
 
 from ..config import get_config
+from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
 from ..storage.policy import InvalidFileTypeError
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 
 def list_canvases() -> list[str]:
@@ -29,7 +31,7 @@ def read_canvas(path: str) -> dict:
     if not storage.exists(path, read=True):
         raise FileNotFoundError(f"Canvas not found: {path!r}")
     try:
-        raw = storage.read_text(path)
+        raw, revision = storage.read_text_with_revision(path)
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid canvas JSON in {path!r}: {exc}") from exc
@@ -56,13 +58,15 @@ def read_canvas(path: str) -> dict:
             "label": edge.get("label"),
         })
 
-    return {"path": path, "nodes": nodes, "edges": edges}
+    return {"path": path, "nodes": nodes, "edges": edges, "revision": revision.to_dict()}
 
 
 def write_canvas(
     path: str,
     nodes: list[dict] | None = None,
     edges: list[dict] | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
 ) -> dict:
     """Create or fully overwrite a canvas file.
 
@@ -77,6 +81,7 @@ def write_canvas(
         raise InvalidFileTypeError("Canvas paths must end in .canvas")
     target = storage.resolve_write(path)
     path = target.relative
+    intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
 
     built_nodes = [_normalize_node(n) for n in (nodes or [])]
     built_edges = [_normalize_edge(e) for e in (edges or [])]
@@ -84,16 +89,18 @@ def write_canvas(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        storage.write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
+        revision = storage.write_text_atomic(
+            path,
+            json.dumps(data, indent=2, ensure_ascii=False),
+            expected_revision=intent.expected_revision,
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
-    return {
-        "path": path,
-        "status": "written",
-        "nodes": len(built_nodes),
-        "edges": len(built_edges),
-    }
+    return revision_result(
+        path, revision, status="written", nodes=len(built_nodes), edges=len(built_edges)
+    )
 
 
 def patch_canvas(
@@ -103,6 +110,7 @@ def patch_canvas(
     delete_node_ids: list[str] | None = None,
     add_edges: list[dict] | None = None,
     delete_edge_ids: list[str] | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Atomically update an existing canvas: add/update/delete nodes and edges.
 
@@ -121,9 +129,12 @@ def patch_canvas(
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
         try:
-            data = json.loads(storage.read_text(path))
+            raw, read_revision = storage.read_text_with_revision(path)
+            data = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid canvas JSON in {path!r}: {exc}") from exc
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
 
         nodes: list[dict] = data.get("nodes", [])
         edges: list[dict] = data.get("edges", [])
@@ -157,16 +168,20 @@ def patch_canvas(
         if add_edges:
             edges.extend(_normalize_edge(e) for e in add_edges)
 
-        storage.write_text_atomic(path, json.dumps({"nodes": nodes, "edges": edges}, indent=2, ensure_ascii=False))
+        revision = storage.write_text_atomic(
+            path,
+            json.dumps({"nodes": nodes, "edges": edges}, indent=2, ensure_ascii=False),
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
-    return {
-        "path": path,
-        "status": "patched",
-        "nodes": len(nodes),
-        "edges": len(edges),
-    }
+    return revision_result(path, revision, status="patched", nodes=len(nodes), edges=len(edges))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

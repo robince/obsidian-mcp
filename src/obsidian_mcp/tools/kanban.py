@@ -12,10 +12,12 @@ import re
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.models import FileRevision
 from ..domain.parser import parse_note
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
 from ..storage.policy import InvalidFileTypeError
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 # Matches - [ ] text  or  - [x] / - [X] text
 _CARD_RE = re.compile(r"^- \[([ xX])\] (.+)$", re.MULTILINE)
@@ -40,7 +42,7 @@ def read_kanban(path: str) -> dict:
     if not storage.exists(path, read=True):
         raise FileNotFoundError(f"Kanban board not found: {path!r}")
 
-    raw = storage.read_text(path)
+    raw, revision = storage.read_text_with_revision(path)
     note = parse_note(raw, path=path)
 
     if "kanban-plugin" not in note.frontmatter:
@@ -53,6 +55,7 @@ def read_kanban(path: str) -> dict:
         "plugin": note.frontmatter.get("kanban-plugin", "basic"),
         "columns": columns,
         "total_cards": sum(len(c["cards"]) for c in columns),
+        "revision": revision.to_dict(),
     }
 
 
@@ -60,6 +63,8 @@ def create_kanban_board(
     path: str,
     columns: list[str],
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
 ) -> dict:
     """Create a new Kanban board with the given column names."""
     cfg = get_config()
@@ -68,6 +73,7 @@ def create_kanban_board(
         raise InvalidFileTypeError("Kanban paths must end in .md")
     target = storage.resolve_write(path)
     path = target.relative
+    intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
 
     lines = ["---", "kanban-plugin: basic", "---", ""]
     for col in columns:
@@ -76,13 +82,15 @@ def create_kanban_board(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        storage.write_text_atomic(path, content)
+        revision = storage.write_text_atomic(
+            path, content, expected_revision=intent.expected_revision, create_only=intent.create_only
+        )
     finally:
         lock.release()
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "created", "columns": columns}
+    return revision_result(path, revision, status="created", columns=columns)
 
 
 def add_kanban_card(
@@ -91,6 +99,7 @@ def add_kanban_card(
     text: str,
     done: bool = False,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Add a new card to a column. New cards are inserted at the top of the column."""
     cfg = get_config()
@@ -105,16 +114,27 @@ def add_kanban_card(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        raw = storage.read_text(path)
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         patched = _add_card(raw, column, text, done)
-        storage.write_text_atomic(path, patched)
+        revision = storage.write_text_atomic(
+            path,
+            patched,
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "added", "column": column, "card": text, "done": done}
+    return revision_result(path, revision, status="added", column=column, card=text, done=done)
 
 
 def move_kanban_card(
@@ -124,6 +144,7 @@ def move_kanban_card(
     to_column: str,
     done: bool | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Move a card between columns. done=True/False overwrites the card's tick state."""
     cfg = get_config()
@@ -138,24 +159,31 @@ def move_kanban_card(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        raw = storage.read_text(path)
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         patched, moved = _move_card(raw, card_text, from_column, to_column, done)
         if not moved:
             raise ValueError(f"Card {card_text!r} not found in column {from_column!r}")
-        storage.write_text_atomic(path, patched)
+        revision = storage.write_text_atomic(
+            path,
+            patched,
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {
-        "path": path,
-        "status": "moved",
-        "card": card_text,
-        "from": from_column,
-        "to": to_column,
-    }
+    return revision_result(
+        path, revision, status="moved", card=card_text, from_column=from_column, to_column=to_column
+    )
 
 
 def delete_kanban_card(
@@ -163,6 +191,7 @@ def delete_kanban_card(
     card_text: str,
     column: str | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Remove a card from the board. If column is given, only search there."""
     cfg = get_config()
@@ -177,19 +206,30 @@ def delete_kanban_card(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        raw = storage.read_text(path)
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         patched, deleted = _delete_card(raw, card_text, column)
         if not deleted:
             col_info = f" in column {column!r}" if column else ""
             raise ValueError(f"Card {card_text!r} not found{col_info}")
-        storage.write_text_atomic(path, patched)
+        revision = storage.write_text_atomic(
+            path,
+            patched,
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "deleted", "card": card_text}
+    return revision_result(path, revision, status="deleted", card=card_text)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

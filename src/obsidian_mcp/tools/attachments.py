@@ -10,8 +10,11 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from ..config import get_config
+from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
+from ..storage.locking import acquire_lock
 from ..storage.policy import InvalidFileTypeError
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 _TEXT_SUFFIXES = {".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".js", ".ts"}
 _MAX_TOKEN_TTL = 3600
@@ -90,24 +93,33 @@ def read_attachment(path: str) -> dict:
     is_text = mime.startswith("text/") or Path(path).suffix.lower() in _TEXT_SUFFIXES
 
     if is_text:
+        raw, revision = storage.read_text_with_revision(path)
         return {
             "path": path,
             "mime_type": mime,
             "encoding": "utf-8",
-            "content": storage.read_text(path),
+            "content": raw,
+            "revision": revision.to_dict(),
         }
 
-    data = storage.read_bytes(path)
+    data, revision = storage.read_bytes_with_revision(path)
     return {
         "path": path,
         "mime_type": mime,
         "encoding": "base64",
         "content": base64.b64encode(data).decode("ascii"),
         "size_bytes": len(data),
+        "revision": revision.to_dict(),
     }
 
 
-def write_attachment_bytes(path: str, data: bytes) -> dict:
+def write_attachment_bytes(
+    path: str,
+    data: bytes,
+    *,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
+) -> dict:
     """Write raw bytes as a binary attachment.
 
     Shared by add_attachment (decodes base64 from an MCP tool call) and the
@@ -122,18 +134,28 @@ def write_attachment_bytes(path: str, data: bytes) -> dict:
             f"Attachment exceeds MAX_ATTACHMENT_BYTES ({cfg.max_attachment_bytes} bytes)"
         )
 
-    storage.write_bytes_atomic(path, data)
+    intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
+    lock = acquire_lock(path, lock_path=cfg.lock_path)
+    try:
+        revision = storage.write_bytes_atomic(
+            path, data, expected_revision=intent.expected_revision, create_only=intent.create_only
+        )
+    finally:
+        lock.release()
 
     mime, _ = mimetypes.guess_type(path)
-    return {
-        "path": path,
-        "status": "written",
-        "size_bytes": len(data),
-        "mime_type": mime or "application/octet-stream",
-    }
+    return revision_result(
+        path, revision, status="written", size_bytes=len(data), mime_type=mime or "application/octet-stream"
+    )
 
 
-def add_attachment(path: str, content_base64: str) -> dict:
+def add_attachment(
+    path: str,
+    content_base64: str,
+    *,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
+) -> dict:
     """Write a binary attachment from a base64-encoded string.
     Use this to add images, PDFs, or other binary files to the vault."""
     cfg = get_config()
@@ -149,7 +171,7 @@ def add_attachment(path: str, content_base64: str) -> dict:
     except Exception as exc:
         raise ValueError(f"Invalid base64 content: {exc}") from exc
 
-    return write_attachment_bytes(path, data)
+    return write_attachment_bytes(path, data, expected_revision=expected_revision, create_only=create_only)
 
 
 def _sign_attachment_token(api_key: str, method: str, path: str, expires_at: int) -> str:

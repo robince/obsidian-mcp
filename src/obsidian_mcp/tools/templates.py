@@ -6,7 +6,10 @@ from pathlib import Path
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
+from ..storage.locking import acquire_lock
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 # Matches {{variable}} and {{variable:format}}
 _VAR_RE = re.compile(r"\{\{(\w+)(?::([^}]*))?\}\}")
@@ -17,6 +20,8 @@ def create_from_template(
     output_path: str,
     variables: dict | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
 ) -> dict:
     """Render a template and write the result as a new note.
 
@@ -31,6 +36,7 @@ def create_from_template(
         raise ValueError("Template output paths must end in .md")
     output = storage.resolve_write(output_path)
     output_path = output.relative
+    intent = enforce_precondition_policy(storage, output_path, expected_revision, create_only)
 
     raw_template = storage.read_text(template_path)
 
@@ -72,17 +78,18 @@ def create_from_template(
         return val
 
     rendered = _VAR_RE.sub(_replace, raw_template)
-    storage.write_text_atomic(output_path, rendered)
+    lock = acquire_lock(output_path, lock_path=cfg.lock_path)
+    try:
+        revision = storage.write_text_atomic(
+            output_path, rendered, expected_revision=intent.expected_revision, create_only=intent.create_only
+        )
+    finally:
+        lock.release()
 
     if index is not None:
         index.update(output_path)
 
-    return {
-        "template": template_path,
-        "output": output_path,
-        "status": "created",
-        "variables": merged,
-    }
+    return revision_result(output_path, revision, template=template_path, output=output_path, status="created", variables=merged)
 
 
 def list_templates() -> list[str]:

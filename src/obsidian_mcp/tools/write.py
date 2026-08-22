@@ -7,9 +7,12 @@ import yaml
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.models import FileRevision, RevisionConflictError
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
+from ..storage.operations import OperationLedger, OperationOutcomeUnknownError
 from ..storage.policy import WritePermissionError as PolicyWritePermissionError
+from ..storage.revisions import enforce_precondition_policy, revision_result, stage_conflict
 from .read import _is_excluded
 
 WritePermissionError = PolicyWritePermissionError
@@ -29,7 +32,14 @@ def _require_note_path(path: str) -> str:
     return path
 
 
-def write_note(path: str, content: str, index: VaultIndex | None = None) -> dict:
+def write_note(
+    path: str,
+    content: str,
+    index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
+    operation_id: str | None = None,
+) -> dict:
     """Write (create or overwrite) a note.
 
     If `content` has no YAML frontmatter of its own and a note already exists
@@ -45,23 +55,39 @@ def write_note(path: str, content: str, index: VaultIndex | None = None) -> dict
     lock = acquire_lock(path, lock_path=get_config().lock_path)
     try:
         frontmatter_preserved = False
+        existing_revision = None
+        existing_raw = ""
         if not _FM_RE.match(content) and storage.exists(path, read=False):
-            try:
-                existing_raw = storage.read_text(path)
-            except Exception:
-                existing_raw = ""
+            existing_raw, existing_revision = storage.read_text_with_revision(path)
             existing_fm, _ = _parse_frontmatter(existing_raw)
             if existing_fm:
                 content = _serialize_frontmatter(existing_fm, content)
                 frontmatter_preserved = True
-        storage.write_text_atomic(path, content)
+        policy_expected = expected_revision
+        if frontmatter_preserved and policy_expected is None and existing_revision is not None:
+            policy_expected = existing_revision.token
+        intent = enforce_precondition_policy(storage, path, policy_expected, create_only)
+        effective_expected = intent.expected_revision
+        try:
+            revision = storage.write_text_atomic(
+                path, content, expected_revision=effective_expected, create_only=intent.create_only
+            )
+        except RevisionConflictError as exc:
+            staged = stage_conflict(operation_id=operation_id, path=path, proposed=content.encode())
+            exc.staged_path = staged
+            raise
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "written", "frontmatter_preserved": frontmatter_preserved}
+    return revision_result(
+        path,
+        revision,
+        status="written",
+        frontmatter_preserved=frontmatter_preserved,
+    )
 
 
 def patch_note(
@@ -71,6 +97,7 @@ def patch_note(
     mode: str = "replace",
     target_type: str = "heading",
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Edit a note section or block reference.
 
@@ -83,19 +110,27 @@ def patch_note(
 
     lock = acquire_lock(path, lock_path=get_config().lock_path)
     try:
-        raw = _storage().read_text(path)
+        storage = _storage()
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         if target_type == "block_ref":
             patched = _patch_block_ref(raw, section, new_content, mode)
         else:
             patched = _patch_section(raw, section, new_content, mode)
-        _storage().write_text_atomic(path, patched)
+        effective_expected = (
+            intent.expected_revision
+            if intent.expected_revision is not None
+            else read_revision.token
+        )
+        revision = storage.write_text_atomic(path, patched, expected_revision=effective_expected, create_only=intent.create_only)
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "patched", "mode": mode, "target_type": target_type}
+    return revision_result(path, revision, status="patched", mode=mode, target_type=target_type)
 
 
 def _find_section_bounds(content: str, heading: str) -> tuple[int, int, int, int]:
@@ -141,7 +176,12 @@ def _patch_block_ref(content: str, block_id: str, new_content: str, mode: str) -
     raise ValueError(f"Unknown mode: {mode!r}")
 
 
-def delete_note(path: str, trash: bool = True, index: VaultIndex | None = None) -> dict:
+def delete_note(
+    path: str,
+    trash: bool = True,
+    index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+) -> dict:
     """Delete a note. trash=True moves it to .trash/ in the vault root."""
     cfg = get_config()
     _require_note_path(path)
@@ -149,20 +189,32 @@ def delete_note(path: str, trash: bool = True, index: VaultIndex | None = None) 
     path = target.relative
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
+        storage = _storage()
+        intent = enforce_precondition_policy(storage, path, expected_revision, False)
+        if expected_revision is not None:
+            actual = storage.revision(path)
+            if actual.sha256 != FileRevision.from_value(expected_revision).sha256:
+                raise RevisionConflictError(path, expected_revision, actual)
+        source_revision = intent.observed_revision if intent.observed_revision is not None else intent.expected_revision
         if trash:
-            _storage().trash(path)
+            storage.trash(path, expected_revision=source_revision)
         else:
-            _storage().delete(path, permanent=True)
+            storage.delete(path, permanent=True, expected_revision=source_revision)
     finally:
         lock.release()
 
     if index is not None:
         index.remove(path)
 
-    return {"path": path, "status": "deleted", "trash": trash}
+    return {"path": path, "status": "deleted", "trash": trash, "revision": None}
 
 
-def restore_note(trashed_name: str, to_path: str, index: VaultIndex | None = None) -> dict:
+def restore_note(
+    trashed_name: str,
+    to_path: str,
+    index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+) -> dict:
     """Restore a note previously moved to .trash/ (via delete_note trash=True).
 
     trashed_name: the filename as it sits under .trash/ (see list_trash_tool) —
@@ -185,15 +237,16 @@ def restore_note(trashed_name: str, to_path: str, index: VaultIndex | None = Non
 
     lock = acquire_lock(f".trash/{trashed_name}", lock_path=cfg.lock_path)
     try:
-        destination = storage.restore(trashed_name, to_path)
+        destination = storage.restore(trashed_name, to_path, expected_revision=expected_revision)
         to_path = destination.relative
+        revision = storage.revision(to_path)
     finally:
         lock.release()
 
     if index is not None:
         index.update(to_path)
 
-    return {"from": f".trash/{trashed_name}", "to": to_path, "status": "restored"}
+    return {"from": f".trash/{trashed_name}", "to": to_path, "status": "restored", "revision": revision.to_dict()}
 
 
 def append_to_note(
@@ -202,32 +255,86 @@ def append_to_note(
     section: str | None = None,
     create: bool = True,
     index: VaultIndex | None = None,
+    operation_id: str | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    principal_id: str = "mcp",
 ) -> dict:
-    """Append content to a note (or a specific section). Creates the note if it doesn't exist."""
+    """Append under one path lock, with an implicit CAS for retryable calls."""
     _require_note_path(path)
-    target = _storage().resolve_write(path)
-    path = target.relative
+    storage = _storage()
+    path = storage.resolve_write(path).relative
     lock = acquire_lock(path, lock_path=get_config().lock_path)
     try:
-        storage = _storage()
-        if storage.exists(path, read=True):
-            raw = _storage().read_text(path)
-            if section:
-                patched = _patch_section(raw, section, content, mode="append")
-            else:
-                patched = raw.rstrip("\n") + "\n\n" + content.strip() + "\n"
+        # One descriptor-relative read gives both the exact bytes used to
+        # produce the proposal and its authoritative starting revision.
+        try:
+            raw, initial = storage.read_text_with_revision(path)
+            exists = True
+        except FileNotFoundError:
+            raw, initial, exists = "", None, False
+        # Appending is read-modify-write even without an operation ID. The
+        # exact revision just read therefore supplies an implicit CAS and
+        # satisfies REQUIRE_WRITE_PRECONDITIONS for existing notes.
+        policy_expected = expected_revision or (initial.token if initial else None)
+        intent = enforce_precondition_policy(storage, path, policy_expected, False)
+        if expected_revision is not None and (initial is None or initial.sha256 != FileRevision.from_value(expected_revision).sha256):
+            raise RevisionConflictError(path, expected_revision, initial)
+        if exists:
+            patched = _patch_section(raw, section, content, mode="append") if section else raw.rstrip("\n") + "\n\n" + content.strip() + "\n"
         elif create:
             patched = content
         else:
             raise FileNotFoundError(f"Note not found: {path!r}")
-        _storage().write_text_atomic(path, patched)
+
+        # The proposed result digest is known before reservation. A pending
+        # row therefore lets a retry distinguish a committed result from an
+        # unrelated external edit without replaying content blindly.
+        result_digest = FileRevision.from_bytes(patched.encode(), size=len(patched.encode()), mtime_ns=0).token
+        ledger = None
+        digest = None
+        if operation_id:
+            ledger = OperationLedger(get_config().operation_ledger_path, retention_seconds=get_config().operation_retention_seconds)
+            expected_token = FileRevision.from_value(expected_revision).token if expected_revision is not None else None
+            digest = ledger.digest({"tool": "append_to_note", "path": path, "content": content, "section": section, "create": create, "expected_revision": expected_token})
+            pending = ledger.reserve(
+                operation_id,
+                principal_id=principal_id,
+                tool_name="append_to_note",
+                target_path=path,
+                request_digest=digest,
+                initial_revision=initial.token if initial else None,
+                expected_result_revision=result_digest,
+            )
+            if pending is not None and not pending.get("_pending"):
+                return pending
+            if pending is not None:
+                current = storage.revision(path).token if storage.exists(path, read=False) else None
+                if current == pending.get("expected_result_revision"):
+                    recovered = revision_result(path, storage.revision(path), status="recovered")
+                    ledger.record(operation_id, principal_id=principal_id, tool_name="append_to_note", target_path=path, request_digest=digest, result=recovered, result_revision=current)
+                    return recovered
+                if current != pending.get("initial_revision"):
+                    raise OperationOutcomeUnknownError(operation_id, path)
+
+        try:
+            revision = storage.write_text_atomic(
+                path,
+                patched,
+                expected_revision=(initial.token if initial else intent.expected_revision),
+                create_only=(initial is None) and intent.create_only,
+            )
+        except RevisionConflictError as exc:
+            exc.staged_path = stage_conflict(operation_id=operation_id, path=path, proposed=patched.encode(), expected=exc.expected, actual=exc.actual.token if exc.actual else None)
+            raise
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
-
-    return {"path": path, "status": "appended"}
+    result = revision_result(path, revision, status="appended")
+    if operation_id and ledger is not None and digest is not None:
+        ledger.record(operation_id, principal_id=principal_id, tool_name="append_to_note", target_path=path, request_digest=digest, result=result, result_revision=revision.token)
+    return result
 
 
 def patch_frontmatter(
@@ -235,6 +342,7 @@ def patch_frontmatter(
     updates: dict,
     merge_arrays: bool = True,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Update specific YAML frontmatter keys. Arrays are merged by default."""
     _require_note_path(path)
@@ -246,16 +354,24 @@ def patch_frontmatter(
 
     lock = acquire_lock(path, lock_path=get_config().lock_path)
     try:
-        raw = _storage().read_text(path)
+        storage = _storage()
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         patched = _apply_frontmatter_updates(raw, updates, merge_arrays)
-        _storage().write_text_atomic(path, patched)
+        effective_expected = (
+            intent.expected_revision
+            if intent.expected_revision is not None
+            else read_revision.token
+        )
+        revision = storage.write_text_atomic(path, patched, expected_revision=effective_expected, create_only=intent.create_only)
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "frontmatter_patched", "updated_keys": list(updates.keys())}
+    return revision_result(path, revision, status="frontmatter_patched", updated_keys=list(updates.keys()))
 
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?", re.DOTALL)
@@ -285,6 +401,7 @@ def manage_tags(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Add or remove tags on a note. Updates frontmatter tags array and strips inline #tags."""
     _require_note_path(path)
@@ -299,16 +416,24 @@ def manage_tags(
 
     lock = acquire_lock(path, lock_path=get_config().lock_path)
     try:
-        raw = _storage().read_text(path)
+        storage = _storage()
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         patched = _apply_tag_changes(raw, add, remove)
-        _storage().write_text_atomic(path, patched)
+        effective_expected = (
+            intent.expected_revision
+            if intent.expected_revision is not None
+            else read_revision.token
+        )
+        revision = storage.write_text_atomic(path, patched, expected_revision=effective_expected, create_only=intent.create_only)
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "tags_updated", "added": add, "removed": remove}
+    return revision_result(path, revision, status="tags_updated", added=add, removed=remove)
 
 
 def _apply_tag_changes(raw: str, add: list[str], remove: list[str]) -> str:

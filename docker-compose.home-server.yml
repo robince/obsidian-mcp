@@ -26,6 +26,16 @@ services:
       ALLOW_PERMANENT_DELETE: "false"
       MAX_ATTACHMENT_BYTES: "${MAX_ATTACHMENT_BYTES:-26214400}"
       LOCK_PATH: /data/locks
+      OPERATION_LEDGER_PATH: /data/operations.sqlite3
+      CONFLICT_PATH: /data/conflicts
+      STORE_CONFLICT_CONTENT: "${STORE_CONFLICT_CONTENT:-false}"
+      REQUIRE_WRITE_PRECONDITIONS: "${REQUIRE_WRITE_PRECONDITIONS:-true}"
+      ALLOW_BLIND_CREATE: "${ALLOW_BLIND_CREATE:-true}"
+      ALLOW_BLIND_OVERWRITE: "${ALLOW_BLIND_OVERWRITE:-false}"
+      OPERATION_RETENTION_SECONDS: "${OPERATION_RETENTION_SECONDS:-604800}"
+      INDEX_RECONCILE_INTERVAL: "${INDEX_RECONCILE_INTERVAL:-300}"
+      WATCHER_DEBOUNCE_MS: "${WATCHER_DEBOUNCE_MS:-100}"
+      WATCHER_MAX_PENDING_EVENTS: "${WATCHER_MAX_PENDING_EVENTS:-10000}"
       EXCLUDE_PATHS: "private,.obsidian,.trash"
       API_KEY: "${API_KEY:?set API_KEY in .env}"
       ENABLE_CANVAS: "${ENABLE_CANVAS:-false}"
@@ -34,6 +44,7 @@ services:
       ENABLE_BASES: "${ENABLE_BASES:-false}"
       ENABLE_MOVE: "${ENABLE_MOVE:-false}"
       ENABLE_FOLDER_RENAME: "${ENABLE_FOLDER_RENAME:-false}"
+      ENABLE_FOLDER_RESTORE: "false"
       ENABLE_BULK_REPLACE: "${ENABLE_BULK_REPLACE:-false}"
       # Trash requires a cross-mount rename into the read-only parent vault.
       # It is deliberately unavailable in this nested-bind profile.

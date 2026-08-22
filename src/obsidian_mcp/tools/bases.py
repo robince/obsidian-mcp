@@ -19,9 +19,11 @@ import yaml
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.models import FileRevision
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
 from ..storage.policy import InvalidFileTypeError
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -45,13 +47,14 @@ def read_base(path: str) -> dict:
     if not storage.exists(path, read=True):
         raise FileNotFoundError(f"Base not found: {path!r}")
 
-    data = _load_yaml(storage, path)
+    data, revision = _load_yaml_with_revision(storage, path)
     return {
         "path": path,
         "filters": data.get("filters", {}),
         "formulas": data.get("formulas", {}),
         "properties": data.get("properties", {}),
         "views": data.get("views", []),
+        "revision": revision.to_dict(),
     }
 
 
@@ -62,6 +65,8 @@ def write_base(
     properties: dict | None = None,
     views: list[dict] | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
 ) -> dict:
     """Create or fully overwrite a .base file.
 
@@ -80,6 +85,7 @@ def write_base(
         raise InvalidFileTypeError("Bases paths must end in .base")
     target = storage.resolve_write(path)
     path = target.relative
+    intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
 
     data = {
         k: v
@@ -97,19 +103,18 @@ def write_base(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        _write_base_atomic(storage, path, data)
+        revision = _write_base_atomic(
+            storage, path, data, expected_revision=intent.expected_revision, create_only=intent.create_only
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {
-        "path": path,
-        "status": "written",
-        "views": len(data.get("views", [])),
-        "known_properties": known_properties,
-    }
+    return revision_result(
+        path, revision, status="written", views=len(data.get("views", [])), known_properties=known_properties
+    )
 
 
 def patch_base(
@@ -123,6 +128,7 @@ def patch_base(
     update_views: list[dict] | None = None,
     delete_view_names: list[str] | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Atomically update an existing .base file without rewriting it wholesale.
 
@@ -142,7 +148,9 @@ def patch_base(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        data = _load_yaml(storage, path)
+        data, read_revision = _load_yaml_with_revision(storage, path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
 
         formulas: dict = dict(data.get("formulas", {}))
         if delete_formula_keys:
@@ -188,14 +196,24 @@ def patch_base(
             del data["views"]
 
         _validate_base_structure(data, path)
-        _write_base_atomic(storage, path, data)
+        revision = _write_base_atomic(
+            storage,
+            path,
+            data,
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "patched", "views": len(data.get("views", []))}
+    return revision_result(path, revision, status="patched", views=len(data.get("views", [])))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -209,6 +227,17 @@ def _load_yaml(storage: VaultStorage, path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"Invalid base structure in {path!r}: top level must be a mapping")
     return data
+
+
+def _load_yaml_with_revision(storage: VaultStorage, path: str) -> tuple[dict, FileRevision]:
+    raw, revision = storage.read_text_with_revision(path)
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid base YAML in {path!r}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid base structure in {path!r}: top level must be a mapping")
+    return data, revision
 
 
 def _validate_base_structure(data: dict, path: str) -> None:
@@ -250,11 +279,20 @@ def _known_properties(exclude_path: str | None = None) -> dict:
     return known
 
 
-def _write_base_atomic(storage: VaultStorage, path: str, data: dict) -> None:
+def _write_base_atomic(
+    storage: VaultStorage,
+    path: str,
+    data: dict,
+    *,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
+) -> FileRevision:
     content = yaml.safe_dump(
         data,
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,
     )
-    storage.write_text_atomic(path, content)
+    return storage.write_text_atomic(
+        path, content, expected_revision=expected_revision, create_only=create_only
+    )

@@ -19,10 +19,12 @@ import uuid
 
 from ..config import get_config
 from ..domain.index import VaultIndex
+from ..domain.models import FileRevision
 from ..domain.parser import parse_note
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
 from ..storage.policy import InvalidFileTypeError
+from ..storage.revisions import enforce_precondition_policy, revision_result
 
 _DRAWING_BLOCK_RE = re.compile(r"## Drawing\s*\n```json\n(.*?)\n```", re.DOTALL)
 
@@ -68,7 +70,7 @@ def read_excalidraw(path: str) -> dict:
     if not storage.exists(path, read=True):
         raise FileNotFoundError(f"Excalidraw file not found: {path!r}")
 
-    raw = storage.read_text(path)
+    raw, revision = storage.read_text_with_revision(path)
     note = parse_note(raw, path=path)
     if "excalidraw-plugin" not in note.frontmatter:
         raise ValueError(
@@ -81,6 +83,7 @@ def read_excalidraw(path: str) -> dict:
         "elements": data.get("elements", []),
         "app_state": data.get("appState", {}),
         "files": data.get("files", {}),
+        "revision": revision.to_dict(),
     }
 
 
@@ -89,6 +92,8 @@ def write_excalidraw(
     elements: list[dict] | None = None,
     app_state: dict | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
+    create_only: bool = False,
 ) -> dict:
     """Create or fully overwrite an Excalidraw file.
 
@@ -101,20 +106,26 @@ def write_excalidraw(
         raise InvalidFileTypeError("Excalidraw paths must end in .excalidraw.md")
     target = storage.resolve_write(path)
     path = target.relative
+    intent = enforce_precondition_policy(storage, path, expected_revision, create_only)
 
     built_elements = [_normalize_element(e) for e in (elements or [])]
     data = _build_scene(built_elements, app_state or {})
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        storage.write_text_atomic(path, _build_excalidraw_content(data))
+        revision = storage.write_text_atomic(
+            path,
+            _build_excalidraw_content(data),
+            expected_revision=intent.expected_revision,
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "written", "elements": len(built_elements)}
+    return revision_result(path, revision, status="written", elements=len(built_elements))
 
 
 def patch_excalidraw(
@@ -123,6 +134,7 @@ def patch_excalidraw(
     update_elements: list[dict] | None = None,
     delete_element_ids: list[str] | None = None,
     index: VaultIndex | None = None,
+    expected_revision: FileRevision | str | dict | None = None,
 ) -> dict:
     """Atomically update an existing Excalidraw file: add/update/delete elements.
 
@@ -139,7 +151,9 @@ def patch_excalidraw(
 
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
-        raw = storage.read_text(path)
+        raw, read_revision = storage.read_text_with_revision(path)
+        read_expected = expected_revision if expected_revision is not None else read_revision.token
+        intent = enforce_precondition_policy(storage, path, read_expected, False)
         data = _extract_scene(raw, path)
         elements: list[dict] = data.get("elements", [])
 
@@ -159,14 +173,23 @@ def patch_excalidraw(
             elements.extend(_normalize_element(e) for e in add_elements)
 
         new_data = _build_scene(elements, data.get("appState", {}))
-        storage.write_text_atomic(path, _build_excalidraw_content(new_data))
+        revision = storage.write_text_atomic(
+            path,
+            _build_excalidraw_content(new_data),
+            expected_revision=(
+                intent.expected_revision
+                if intent.expected_revision is not None
+                else read_revision.token
+            ),
+            create_only=intent.create_only,
+        )
     finally:
         lock.release()
 
     if index is not None:
         index.update(path)
 
-    return {"path": path, "status": "patched", "elements": len(elements)}
+    return revision_result(path, revision, status="patched", elements=len(elements))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

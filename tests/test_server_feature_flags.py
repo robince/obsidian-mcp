@@ -12,7 +12,7 @@ import obsidian_mcp.server as server_mod
 
 _FLAG_ENV = (
     "ENABLE_CANVAS", "ENABLE_EXCALIDRAW", "ENABLE_KANBAN", "ENABLE_BASES",
-    "ENABLE_MOVE", "ENABLE_FOLDER_RENAME", "ENABLE_BULK_REPLACE", "ENABLE_DELETE",
+    "ENABLE_MOVE", "ENABLE_FOLDER_RENAME", "ENABLE_FOLDER_RESTORE", "ENABLE_BULK_REPLACE", "ENABLE_DELETE",
 )
 
 _GROUP_TOOLS = {
@@ -33,6 +33,7 @@ _HIGH_RISK_TOOLS = {
     "folder_rename": {"rename_folder_tool"},
     "bulk_replace": {"find_replace_in_vault_tool"},
     "delete": {"delete_note_tool", "delete_folder_tool"},
+    "folder_restore": {"restore_folder_tool"},
 }
 
 

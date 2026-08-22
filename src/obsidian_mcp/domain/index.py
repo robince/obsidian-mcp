@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..storage.filesystem import VaultStorage
 from ..storage.policy import VaultAccessPolicy
+from .models import FileRevision
 from .parser import parse_note
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,9 @@ class VaultIndex:
         self._alias_index: dict[str, str] = {}        # alias_lower → real_path
         self._block_index: dict[str, dict[str, int]] = {}  # path → {block_id → line}
         self._all_notes: set[str] = set()
+        self._revisions: dict[str, FileRevision] = {}
 
-    def build(self) -> None:
+    def build(self, *, publish_ready: bool = True) -> None:
         # Discover through the storage gateway.  In addition to applying the
         # read policy this walks directories with O_NOFOLLOW, so a denied or
         # symlinked subtree is never fed to the indexer.
@@ -56,19 +58,25 @@ class VaultIndex:
             self._alias_index.clear()
             self._block_index.clear()
             self._all_notes.clear()
+            self._revisions.clear()
 
         for md_file in md_files:
             rel = md_file.relative
             try:
-                raw = self._storage.read_text(rel)
+                raw, revision = self._storage.read_text_with_revision(rel)
                 note = parse_note(raw, path=rel)
-                self._index_note(rel, note)
+                self._index_note(rel, note, revision=revision)
             except Exception:
                 logger.exception("Failed to index %s", rel)
 
+        if publish_ready:
+            self.mark_ready()
+        logger.info("VaultIndex ready – %d notes indexed", len(self._all_notes))
+
+    def mark_ready(self) -> None:
+        """Publish a completed snapshot after watcher replay has drained."""
         with self._lock:
             self._ready = True
-        logger.info("VaultIndex ready – %d notes indexed", len(self._all_notes))
 
     def update(self, path: str) -> None:
         try:
@@ -76,6 +84,34 @@ class VaultIndex:
         except Exception:
             self.remove(path)
             return
+        # The watcher also reports directory moves/deletes and non-Markdown
+        # files so it can remove descendants. Only Markdown files enter the
+        # note graph; a regular attachment event is otherwise a no-op.
+        try:
+            info = self._storage.stat(rel)
+            if not stat.S_ISDIR(info.st_mode) and not rel.lower().endswith(".md"):
+                return
+        except FileNotFoundError:
+            if not rel.lower().endswith(".md"):
+                self.remove(rel)
+                self._remove_descendants(rel)
+                return
+        except Exception:
+            # A denied destination is also a removal from the readable index.
+            self.remove(rel)
+            self._remove_descendants(rel)
+            return
+        candidate_revision = None
+        if self._policy.can_read(rel):
+            try:
+                info = self._storage.stat(rel)
+                if not stat.S_ISDIR(info.st_mode):
+                    candidate_revision = self._storage.revision(rel)
+                    with self._lock:
+                        if self._revisions.get(rel) == candidate_revision:
+                            return
+            except (FileNotFoundError, IsADirectoryError):
+                candidate_revision = None
         # Purge the old canonical entry before checking the new filesystem
         # state. This is important when a readable note is renamed into a
         # denied subtree: the watcher may report only the destination path.
@@ -90,10 +126,10 @@ class VaultIndex:
                     if candidate.relative.lower().endswith(".md") and not self._is_excluded(candidate.relative):
                         self.update(candidate.relative)
                 return
-            raw = self._storage.read_text(rel)
+            raw, revision = self._storage.read_text_with_revision(rel)
             note = parse_note(raw, path=rel)
             self.remove(rel)
-            self._index_note(rel, note)
+            self._index_note(rel, note, revision=revision)
         except Exception:
             logger.exception("Failed to update index for %s", path)
 
@@ -117,6 +153,7 @@ class VaultIndex:
                 del self._alias_index[k]
             self._block_index.pop(path, None)
             self._all_notes.discard(path)
+            self._revisions.pop(path, None)
 
     def get_backlinks(self, note_path: str) -> list[str]:
         self._assert_ready()
@@ -184,7 +221,31 @@ class VaultIndex:
     def is_ready(self) -> bool:
         return self._ready
 
-    def _index_note(self, path: str, note) -> None:
+    def reconcile(self) -> dict[str, int]:
+        """Repair missed/coalesced watcher events using content revisions."""
+        current: set[str] = set()
+        changed = 0
+        for candidate in self._storage.list_files():
+            rel = candidate.relative
+            if not rel.lower().endswith(".md") or self._is_excluded(rel):
+                continue
+            current.add(rel)
+            try:
+                revision = self._storage.revision(rel)
+            except OSError:
+                continue
+            with self._lock:
+                known = self._revisions.get(rel)
+            if known != revision:
+                self.update(rel)
+                changed += 1
+        with self._lock:
+            stale = set(self._all_notes) - current
+        for rel in stale:
+            self.remove(rel)
+        return {"changed": changed, "removed": len(stale)}
+
+    def _index_note(self, path: str, note, *, revision: FileRevision | None = None) -> None:
         stem = Path(path).stem
         targets: set[str] = set()
         for link in note.wikilinks:
@@ -192,6 +253,8 @@ class VaultIndex:
 
         with self._lock:
             self._all_notes.add(path)
+            if revision is not None:
+                self._revisions[path] = revision
             # Normalize targets to lowercase for case-insensitive resolution
             targets_lower = {t.lower() for t in targets}
             self._outlinks[path] = targets_lower

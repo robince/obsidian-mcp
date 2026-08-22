@@ -247,7 +247,7 @@ def get_periodic_note(index: VaultIndex, period: str = "daily", date_str: str = 
     storage = VaultStorage.from_config(cfg)
     target = storage.resolve_read(rel_path)
     if storage.exists(target.relative):
-        raw = storage.read_text(target.relative)
+        raw, revision = storage.read_text_with_revision(target.relative)
         note = parse_note(raw, path=rel_path)
         return {
             "path": rel_path,
@@ -257,6 +257,7 @@ def get_periodic_note(index: VaultIndex, period: str = "daily", date_str: str = 
             "content": note.content,
             "frontmatter": note.frontmatter,
             "tasks": [{"text": t.text, "done": t.done, "line": t.line} for t in note.tasks],
+            "revision": revision.to_dict(),
         }
 
     # Preview from template if available

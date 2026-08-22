@@ -146,6 +146,74 @@ async def test_download_route_reads_file(tmp_path, vault_factory, monkeypatch):
     assert resp.status_code == 200
     assert resp.content == b"PDF-CONTENT-\x00\x01\x02"
     assert resp.headers["content-type"] == "application/pdf"
+    assert resp.headers["etag"].startswith('"sha256:')
+
+
+@pytest.mark.asyncio
+async def test_attachment_route_requires_and_checks_if_match(tmp_path, vault_factory, monkeypatch):
+    vault_factory({})
+    (tmp_path / "file.png").write_bytes(b"old")
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("REQUIRE_WRITE_PRECONDITIONS", "true")
+
+    async with _client() as client:
+        missing = await client.put("/attachments/file.png", content=b"new", headers={"Authorization": "Bearer test-key"})
+        current = await client.get("/attachments/file.png", headers={"Authorization": "Bearer test-key"})
+        stale = await client.put(
+            "/attachments/file.png",
+            content=b"new",
+            headers={"Authorization": "Bearer test-key", "If-Match": '"sha256:' + "0" * 64 + '"'},
+        )
+        good = await client.put(
+            "/attachments/file.png",
+            content=b"new",
+            headers={"Authorization": "Bearer test-key", "If-Match": current.headers["etag"]},
+        )
+
+    assert missing.status_code == 428
+    assert stale.status_code == 412
+    assert good.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_attachment_route_parses_etag_lists_and_wildcards(tmp_path, vault_factory, monkeypatch):
+    vault_factory({})
+    (tmp_path / "file.png").write_bytes(b"old")
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("REQUIRE_WRITE_PRECONDITIONS", "true")
+
+    async with _client() as client:
+        current = await client.get("/attachments/file.png", headers={"Authorization": "Bearer test-key"})
+        tag = current.headers["etag"]
+        weak = "W/" + tag
+        cached = await client.get(
+            "/attachments/file.png",
+            headers={"Authorization": "Bearer test-key", "If-None-Match": f'"other", {weak}'},
+        )
+        malformed = await client.put(
+            "/attachments/file.png",
+            content=b"new",
+            headers={"Authorization": "Bearer test-key", "If-Match": weak},
+        )
+        ambiguous = await client.put(
+            "/attachments/file.png",
+            content=b"new",
+            headers={
+                "Authorization": "Bearer test-key",
+                "If-Match": tag,
+                "If-None-Match": "*",
+            },
+        )
+        safe_none = await client.put(
+            "/attachments/new.png",
+            content=b"new",
+            headers={"Authorization": "Bearer test-key", "If-None-Match": "*"},
+        )
+
+    assert cached.status_code == 304
+    assert malformed.status_code == 400
+    assert ambiguous.status_code == 400
+    assert safe_none.status_code == 200
 
 
 @pytest.mark.asyncio
