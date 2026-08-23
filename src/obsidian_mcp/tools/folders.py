@@ -150,7 +150,14 @@ def restore_folder(
             if storage.policy.can_read(rel):
                 index.update(rel)
                 notes_restored += 1
-    result.update({"path": restored.relative, "status": "restored", "notes_restored": notes_restored})
+    result.update(
+        {
+            "path": restored.relative,
+            "transaction_status": result.get("status"),
+            "status": "restored",
+            "notes_restored": notes_restored,
+        }
+    )
     return result
 
 
@@ -187,6 +194,7 @@ def rename_folder(
     if get_config().enable_folder_rename and not approved_digest:
         raise PlanApprovalRequiredError("run the operation in plan mode and approve its plan_digest")
     result = MutationExecutor(storage, index=index).execute(plan, operation_id=operation_id, approved_digest=approved_digest)
+    result["transaction_status"] = result.get("status")
     result["from"] = result["moved"][0]["from"]
     result["to"] = result["moved"][0]["to"]
     result["notes_moved"] = sum(1 for change in plan.index_changes if change.action == "remove")

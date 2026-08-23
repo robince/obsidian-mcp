@@ -128,7 +128,7 @@ class Config:
         self.transaction_path = (
             Path(raw_transactions).expanduser().resolve()
             if raw_transactions
-            else self.lock_path.parent / "transactions"
+            else self.lock_path / "transactions"
         )
         if self.transaction_path == self.vault_path or self.vault_path in self.transaction_path.parents:
             raise ConfigError("TRANSACTION_PATH must be outside VAULT_PATH")

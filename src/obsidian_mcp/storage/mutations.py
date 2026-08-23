@@ -17,7 +17,7 @@ from typing import Any
 from ..domain.models import FileRevision
 from .filesystem import VaultStorage
 from .locking import SEMANTIC_GRAPH_LOCK, acquire_lock
-from .policy import VaultPath
+from .policy import ReadPermissionError, VaultPath, VaultPathError
 
 
 class MutationError(RuntimeError):
@@ -355,11 +355,17 @@ class TransactionJournal:
             return [{"operation_id": "<root>", "status": "corrupt", "path": str(root)}]
         for directory in directories:
             journal = directory / "journal.json"
-            if not journal.is_file() or journal.is_symlink():
-                result.append({"operation_id": directory.name, "status": "orphan", "path": str(directory)})
-                continue
             if journal.is_symlink():
-                result.append({"operation_id": journal.parent.name, "status": "corrupt", "path": str(journal)})
+                result.append(
+                    {
+                        "operation_id": directory.name,
+                        "status": "corrupt",
+                        "path": str(journal),
+                    }
+                )
+                continue
+            if not journal.is_file():
+                result.append({"operation_id": directory.name, "status": "orphan", "path": str(directory)})
                 continue
             try:
                 data = json.loads(journal.read_text(encoding="utf-8"))
@@ -552,6 +558,14 @@ class MutationExecutor:
         return value.relative if isinstance(value, VaultPath) else str(value)
 
     def validate_preconditions(self, plan: MutationPlan) -> None:
+        try:
+            self._validate_preconditions(plan)
+        except (NotADirectoryError, ReadPermissionError, VaultPathError) as exc:
+            raise MutationPreconditionError(
+                "mutation path became inaccessible during validation"
+            ) from exc
+
+    def _validate_preconditions(self, plan: MutationPlan) -> None:
         self.authorize(plan)
         for item in plan.directory_creates:
             path = self._path(item.path)
@@ -709,7 +723,10 @@ class MutationExecutor:
         action = step.get("action")
         if action == "write":
             path = step.get("path")
-            current = _revision(self.storage, path) if path else None
+            try:
+                current = _revision(self.storage, path) if path else None
+            except (NotADirectoryError, ReadPermissionError, VaultPathError):
+                return "unknown"
             original = step.get("original_revision")
             if current is None and original is None:
                 return "pre"
@@ -728,7 +745,10 @@ class MutationExecutor:
             return "unknown"
         if action == "delete":
             path = step.get("path")
-            current = _revision(self.storage, path) if path else None
+            try:
+                current = _revision(self.storage, path) if path else None
+            except (NotADirectoryError, ReadPermissionError, VaultPathError):
+                return "unknown"
             if current is None:
                 return "post"
             if current.token == step.get("original_revision"):

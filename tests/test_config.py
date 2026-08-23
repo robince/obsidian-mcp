@@ -100,10 +100,12 @@ def test_security_path_defaults_and_lock_outside_vault(tmp_path, monkeypatch):
 def test_native_default_lock_path_is_external_and_usable(tmp_path, monkeypatch):
     _base_env(monkeypatch, tmp_path)
     monkeypatch.delenv("LOCK_PATH", raising=False)
+    monkeypatch.delenv("TRANSACTION_PATH", raising=False)
     monkeypatch.delenv("FASTMCP_HOME", raising=False)
     cfg = Config()
 
     assert cfg.lock_path == (Path(tempfile.gettempdir()) / "obsidian-mcp-locks").resolve()
+    assert cfg.transaction_path == cfg.lock_path / "transactions"
     assert cfg.lock_path != cfg.vault_path
     lock = acquire_lock("native-test", lock_path=cfg.lock_path)
     lock.release()

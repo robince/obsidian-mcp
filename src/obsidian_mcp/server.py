@@ -1447,7 +1447,14 @@ def delete_folder_tool(
     """Delete a vault folder.
     trash=True (default) moves it to .trash/ instead of permanent deletion.
     Returns {path, status, trash}."""
-    return delete_folder(path, trash=trash, approved_digest=approved_digest, plan_only=plan_only, operation_id=operation_id)
+    return delete_folder(
+        path,
+        trash=trash,
+        index=_index,
+        approved_digest=approved_digest,
+        plan_only=plan_only,
+        operation_id=operation_id,
+    )
 
 
 if _feature_flags.enable_delete:

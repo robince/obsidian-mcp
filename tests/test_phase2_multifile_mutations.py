@@ -5,6 +5,7 @@ import json
 import pytest
 
 import obsidian_mcp.config as cfg_mod
+import obsidian_mcp.server as server_module
 import obsidian_mcp.storage.filesystem as filesystem_module
 import obsidian_mcp.storage.mutations as mutations_module
 from obsidian_mcp.domain.semantics import ParserVaultSemantics, SemanticAmbiguityError
@@ -26,7 +27,7 @@ from obsidian_mcp.storage.mutations import (
     inventory_for_paths,
     recover_transaction,
 )
-from obsidian_mcp.storage.policy import WritePermissionError
+from obsidian_mcp.storage.policy import ReadPermissionError, WritePermissionError
 from obsidian_mcp.tools.folders import delete_folder, rename_folder, restore_folder
 from obsidian_mcp.tools.write import find_replace_in_vault, move_note
 
@@ -187,11 +188,11 @@ def test_move_preserves_alias_link_and_rewrites_relative_path(tmp_path, vault_fa
     assert "[[Legacy]]" in content
 
 
-def test_enabled_bulk_requires_approved_plan_and_detects_stale_revision(vault_factory, monkeypatch):
+def test_enabled_bulk_requires_approved_plan(vault_factory, monkeypatch):
     vault_factory({"a.md": "foo"})
     _enable(monkeypatch, ENABLE_BULK_REPLACE=True)
     dry = find_replace_in_vault("foo", "bar", dry_run=True)
-    with pytest.raises(Exception, match="plan"):
+    with pytest.raises(PlanApprovalRequiredError):
         find_replace_in_vault("foo", "bar", dry_run=False)
     # The fixture's vault is available through the configured storage; change
     # it after planning to force the revision precondition to fail.
@@ -230,6 +231,7 @@ def test_folder_rename_uses_transaction_and_updates_path_links(tmp_path, vault_f
     idx = vault_factory({"Old/note.md": "body", "index.md": "[[Old/note]]"})
     result = rename_folder("Old", "New", index=idx)
     assert result["status"] == "committed"
+    assert result["transaction_status"] == "committed"
     assert (tmp_path / "New/note.md").exists()
     assert (tmp_path / "index.md").read_text() == "[[New/note]]"
 
@@ -303,7 +305,60 @@ def test_semantic_plan_rejects_any_scanned_note_revision_change(vault_factory):
     plan = ParserVaultSemantics(storage).plan_move("old.md", "new.md")
     storage.write_text_atomic("unrelated.md", "changed")
     with pytest.raises(MutationPreconditionError, match="semantic scan changed"):
-        MutationExecutor(storage).execute(plan)
+        MutationExecutor(storage).execute(plan, approved_digest=plan.digest)
+
+
+def test_intent_state_treats_policy_failure_as_unknown(
+    tmp_path, vault_factory, monkeypatch
+):
+    vault_factory({"note.md": "before"})
+    storage = VaultStorage.from_config()
+    executor = MutationExecutor(storage)
+    journal = TransactionJournal(tmp_path.parent / "transactions", "policy-failure")
+    journal.state = {"steps": []}
+
+    def deny_revision(_path):
+        raise ReadPermissionError("denied during recovery")
+
+    monkeypatch.setattr(storage, "revision", deny_revision)
+    plan = MutationPlan(
+        operation="policy-failure",
+        writes=(
+            PlannedWrite(
+                storage.resolve_write("note.md"),
+                "sha256:" + "0" * 64,
+                b"after",
+            ),
+        ),
+    )
+    with pytest.raises(MutationPreconditionError, match="became inaccessible"):
+        executor.validate_preconditions(plan)
+    assert (
+        executor._intent_state(
+            journal,
+            {
+                "action": "write",
+                "path": "note.md",
+                "original_revision": "sha256:" + "0" * 64,
+                "staged": "000000.bin",
+            },
+        )
+        == "unknown"
+    )
+
+
+def test_delete_folder_tool_passes_live_index(monkeypatch):
+    marker = object()
+    received = {}
+
+    def fake_delete(path, **kwargs):
+        received.update({"path": path, **kwargs})
+        return {"status": "deleted"}
+
+    monkeypatch.setattr(server_module, "_index", marker)
+    monkeypatch.setattr(server_module, "delete_folder", fake_delete)
+    assert server_module.delete_folder_tool("Folder") == {"status": "deleted"}
+    assert received["index"] is marker
 
 
 def test_folder_trash_restore_uses_approved_transactions(tmp_path, vault_factory, monkeypatch):
@@ -319,6 +374,7 @@ def test_folder_trash_restore_uses_approved_transactions(tmp_path, vault_factory
         restore_folder("Temp", "Temp")
     restored = restore_folder("Temp", "Temp", index=idx, approved_digest=restore_plan["plan_digest"])
     assert restored["status"] == "restored"
+    assert restored["transaction_status"] == "committed"
     assert (tmp_path / "Temp/note.md").read_text() == "content"
 
 
@@ -627,6 +683,23 @@ def test_orphan_transaction_directory_is_reported(tmp_path):
     orphan.mkdir(parents=True)
     findings = TransactionJournal.scan(orphan.parent)
     assert findings == [{"operation_id": "orphan-id", "status": "orphan", "path": str(orphan)}]
+
+
+def test_symlinked_transaction_journal_is_reported_corrupt(tmp_path):
+    directory = tmp_path / "transactions" / "symlinked"
+    directory.mkdir(parents=True)
+    external = tmp_path / "external.json"
+    external.write_text('{"status":"committed"}')
+    journal = directory / "journal.json"
+    journal.symlink_to(external)
+
+    assert TransactionJournal.scan(directory.parent) == [
+        {
+            "operation_id": "symlinked",
+            "status": "corrupt",
+            "path": str(journal),
+        }
+    ]
 
 
 def test_non_object_transaction_journal_is_reported_corrupt(tmp_path):
