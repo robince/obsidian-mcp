@@ -193,6 +193,14 @@ def test_delete_note_missing_raises(vault_factory):
         delete_note("ghost.md")
 
 
+def test_delete_missing_ignores_blind_create_policy(vault_factory, monkeypatch):
+    monkeypatch.setenv("REQUIRE_WRITE_PRECONDITIONS", "true")
+    monkeypatch.setenv("ALLOW_BLIND_CREATE", "false")
+    vault_factory({})
+    with pytest.raises(FileNotFoundError):
+        delete_note("ghost.md")
+
+
 def test_delete_note_trash_conflict(tmp_path, vault_factory):
     vault_factory({"a.md": "first", "b.md": "second"})
     (tmp_path / ".trash").mkdir()
@@ -281,6 +289,16 @@ def test_append_to_section(tmp_path, vault_factory):
 
 
 def test_append_no_create_raises(vault_factory):
+    vault_factory({})
+    with pytest.raises(FileNotFoundError):
+        append_to_note("ghost.md", "content", create=False)
+
+
+def test_append_without_create_reports_missing_before_policy(
+    vault_factory, monkeypatch
+):
+    monkeypatch.setenv("REQUIRE_WRITE_PRECONDITIONS", "true")
+    monkeypatch.setenv("ALLOW_BLIND_CREATE", "false")
     vault_factory({})
     with pytest.raises(FileNotFoundError):
         append_to_note("ghost.md", "content", create=False)

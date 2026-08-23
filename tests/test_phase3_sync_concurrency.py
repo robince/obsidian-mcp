@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -39,6 +40,29 @@ def test_revision_is_content_authoritative(vault_factory, tmp_path):
 
     (tmp_path / "note.md").write_text("two")
     assert storage.revision("note.md").sha256 != first.sha256
+
+
+def test_index_ignores_mtime_only_changes(vault_factory, tmp_path, monkeypatch):
+    index = vault_factory({"note.md": "one"})
+    note = tmp_path / "note.md"
+    current = note.stat()
+    os.utime(
+        note,
+        ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000),
+    )
+
+    indexed = 0
+    original = index._index_note
+
+    def count_index(*args, **kwargs):
+        nonlocal indexed
+        indexed += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(index, "_index_note", count_index)
+    index.update("note.md")
+    assert index.reconcile() == {"changed": 0, "removed": 0}
+    assert indexed == 0
 
 
 def test_revision_parser_accepts_quoted_prefixed_uppercase_digest():
@@ -342,6 +366,31 @@ def test_operator_conflict_list_and_discard(tmp_path, vault_factory, monkeypatch
     assert records[0]["has_content"] is False
     assert discard_conflict(conflict_id)["status"] == "discarded"
     assert list_conflicts() == []
+
+
+def test_conflict_list_reports_corrupt_record_and_keeps_healthy_records(
+    tmp_path, vault_factory, monkeypatch
+):
+    vault_factory({})
+    conflict_root = tmp_path.parent / "conflicts"
+    monkeypatch.setenv("CONFLICT_PATH", str(conflict_root))
+    import obsidian_mcp.config as config_module
+
+    config_module._config = None
+    from obsidian_mcp.storage.revisions import stage_conflict
+
+    healthy_id = stage_conflict(
+        operation_id="healthy", path="AI-Memory/a.md", proposed=b"content"
+    )
+    corrupt_id = "f" * 64
+    corrupt = conflict_root / corrupt_id
+    corrupt.mkdir()
+    (corrupt / "metadata.json").write_text("not-json")
+
+    records = {record["id"]: record for record in list_conflicts()}
+    assert records[healthy_id]["corrupt"] is False
+    assert records[corrupt_id] == {"id": corrupt_id, "corrupt": True}
+    assert discard_conflict(corrupt_id)["status"] == "discarded"
 
 
 def test_conflict_ids_do_not_collide_and_payload_cannot_replace_metadata(tmp_path, vault_factory, monkeypatch):

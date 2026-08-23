@@ -189,6 +189,8 @@ def delete_note(
     lock = acquire_lock(path, lock_path=cfg.lock_path)
     try:
         storage = _storage()
+        if not storage.exists(path, read=False):
+            raise FileNotFoundError(f"Note not found: {path!r}")
         intent = enforce_precondition_policy(storage, path, expected_revision, False)
         if expected_revision is not None:
             actual = storage.revision(path)
@@ -271,6 +273,8 @@ def append_to_note(
             exists = True
         except FileNotFoundError:
             raw, initial, exists = "", None, False
+        if not exists and not create:
+            raise FileNotFoundError(f"Note not found: {path!r}")
         # Appending is read-modify-write even without an operation ID. The
         # exact revision just read therefore supplies an implicit CAS and
         # satisfies REQUIRE_WRITE_PRECONDITIONS for existing notes.
@@ -282,8 +286,6 @@ def append_to_note(
             patched = _patch_section(raw, section, content, mode="append") if section else raw.rstrip("\n") + "\n\n" + content.strip() + "\n"
         elif create:
             patched = content
-        else:
-            raise FileNotFoundError(f"Note not found: {path!r}")
 
         # The proposed result digest is known before reservation. A pending
         # row therefore lets a retry distinguish a committed result from an

@@ -108,7 +108,11 @@ class VaultIndex:
                 if not stat.S_ISDIR(info.st_mode):
                     candidate_revision = self._storage.revision(rel)
                     with self._lock:
-                        if self._revisions.get(rel) == candidate_revision:
+                        known = self._revisions.get(rel)
+                        if (
+                            known is not None
+                            and known.sha256 == candidate_revision.sha256
+                        ):
                             return
             except (FileNotFoundError, IsADirectoryError):
                 candidate_revision = None
@@ -241,7 +245,7 @@ class VaultIndex:
                 continue
             with self._lock:
                 known = self._revisions.get(rel)
-            if known != revision:
+            if known is None or known.sha256 != revision.sha256:
                 self.update(rel)
                 changed += 1
         with self._lock:

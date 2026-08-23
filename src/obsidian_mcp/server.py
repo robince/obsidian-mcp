@@ -1040,15 +1040,16 @@ async def attachment_route(request: Request) -> Response:
 
     if request.method == "GET":
         try:
-            revision = storage.revision(path)
-        except FileNotFoundError:
-            return JSONResponse({"error": "Attachment not found"}, status_code=404)
-        try:
             if_none = _parse_etag_header(request.headers.get("if-none-match"), allow_weak=True)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        if _etag_matches(revision, if_none):
-            return Response(status_code=304, headers={"ETag": revision.etag})
+        if if_none is not None:
+            try:
+                revision = storage.revision(path)
+            except FileNotFoundError:
+                return JSONResponse({"error": "Attachment not found"}, status_code=404)
+            if _etag_matches(revision, if_none):
+                return Response(status_code=304, headers={"ETag": revision.etag})
         try:
             data, revision = storage.read_bytes_with_revision(path)
         except FileNotFoundError:

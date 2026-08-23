@@ -150,6 +150,33 @@ async def test_download_route_reads_file(tmp_path, vault_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unconditional_download_reads_file_once(
+    tmp_path, vault_factory, monkeypatch
+):
+    vault_factory({})
+    (tmp_path / "file.pdf").write_bytes(b"content")
+    monkeypatch.setenv("API_KEY", "test-key")
+    reads = 0
+    original = server.VaultStorage._read_fd
+
+    def count_reads(self, path):
+        nonlocal reads
+        reads += 1
+        return original(self, path)
+
+    monkeypatch.setattr(server.VaultStorage, "_read_fd", count_reads)
+    async with _client() as client:
+        response = await client.get(
+            "/attachments/file.pdf",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"content"
+    assert reads == 1
+
+
+@pytest.mark.asyncio
 async def test_attachment_route_requires_and_checks_if_match(tmp_path, vault_factory, monkeypatch):
     vault_factory({})
     (tmp_path / "file.png").write_bytes(b"old")

@@ -37,14 +37,25 @@ def list_conflicts() -> list[dict]:
             continue
         metadata = entry / "metadata.json"
         if metadata.is_symlink() or not metadata.is_file():
+            result.append({"id": entry.name, "corrupt": True})
             continue
         try:
             data = json.loads(metadata.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ConflictStoreError(f"corrupt conflict metadata: {entry.name}") from exc
+        except (OSError, ValueError):
+            data = None
         if not isinstance(data, dict):
-            raise ConflictStoreError(f"corrupt conflict metadata: {entry.name}")
-        result.append({**data, "id": entry.name, "has_content": any(p.name != "metadata.json" for p in entry.iterdir())})
+            result.append({"id": entry.name, "corrupt": True})
+            continue
+        result.append(
+            {
+                **data,
+                "id": entry.name,
+                "corrupt": False,
+                "has_content": any(
+                    path.name != "metadata.json" for path in entry.iterdir()
+                ),
+            }
+        )
     return result
 
 
