@@ -64,7 +64,11 @@ budget: 1 MiB. Overall combined JSON text + structured result budget: 8 MiB.
 Attachment reads always return `contentBase64`, `revision`, `mimeType`, `sizeBytes`.
 `add_attachment` is create-only and retains MAX_ATTACHMENT_BYTES and extension
 policy. HTTP attachment transfers require bearer authentication (API key or OAuth);
-legacy scoped signed URLs and their token helpers are removed.
+legacy scoped signed URLs and their token helpers are removed. Remote clients
+must use HTTPS at a TLS-terminating proxy, with the HTTP origin restricted to
+loopback or a private proxy network. Public listeners must require TLS; an
+application redirect cannot protect credentials already sent over HTTP.
+Authenticated downloads return `Cache-Control: no-store`.
 
 ## Search and pagination
 

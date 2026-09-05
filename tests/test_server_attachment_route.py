@@ -400,3 +400,31 @@ async def test_bearer_token_route_enforces_selected_vault_write_policy(tmp_path,
     assert allowed.status_code == 200
     assert not (vault_b / "file.png").exists()
     assert (vault_b / "allowed" / "file.png").read_bytes() == b"allowed"
+
+
+@pytest.mark.asyncio
+async def test_downloads_are_not_cacheable_across_identity_changes(tmp_path, monkeypatch):
+    import json
+
+    import obsidian_mcp.config as cfg_mod
+
+    config_path, vault_a, vault_b = _write_vaults_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["identities"][1]["default"] = "monari"
+    config_path.write_text(json.dumps(config))
+    (vault_a / "file.png").write_bytes(b"private")
+    (vault_b / "file.png").write_bytes(b"monari")
+    _enable_multi_vault_http(monkeypatch, config_path)
+    cfg_mod._config = None
+    monkeypatch.setattr(server.mcp, "auth", server._build_auth())
+
+    # Reuse one client and URL while changing the authenticated identity.
+    # This verifies the server's cache directive, not browser cache internals.
+    async with _client() as client:
+        for key, expected in [("sk-private-only", b"private"), ("sk-both", b"monari")]:
+            response = await client.get(
+                "/attachments/file.png", headers={"Authorization": f"Bearer {key}"}
+            )
+            assert response.status_code == 200
+            assert response.content == expected
+            assert response.headers["cache-control"] == "no-store"

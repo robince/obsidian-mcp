@@ -6,7 +6,7 @@ The implementation follows the final user decision: a clean break with a single
 
 ## Automated and HTTP checks
 
-- Complete Python suite: 637 passing tests, covering existing storage/auth/index
+- Complete Python suite: 638 passing tests, covering existing storage/auth/index
   protection and the new API, raw content, writes, search, pagination and batching.
 - Ruff checks pass for source, tests and the smoke/benchmark scripts.
 - Authenticated localhost HTTP smoke test passes against a disposable vault:
@@ -75,3 +75,11 @@ paths across read tools, one storage construction per read_file, and unchanged
 frontmatter tag projections alongside normalized tag filtering. The unused scoped
 attachment-token authentication branch and mint/verify helpers have been removed;
 HTTP transfers use the existing bearer API-key/OAuth authorization.
+
+
+The subsequent transport review adds no-store headers to authenticated attachment
+downloads, with a same-client/same-URL identity-switch regression. Generic Compose
+publishes the HTTP origin on loopback only; remote transfer examples and recovery
+guidance require HTTPS at the public TLS proxy. TLS enforcement remains at that
+listener so private tunnel-to-origin HTTP continues to work. Application redirects
+cannot secure credentials already transmitted in plaintext.

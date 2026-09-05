@@ -314,6 +314,7 @@ def test_attachment_error_offers_encoded_http_recovery(vault_factory, tmp_path):
     assert exc.value.code == "too_large"
     assert "512000" in str(exc.value)
     assert "authenticated GET /attachments/a%20%23%3F.pdf" in str(exc.value)
+    assert "Use HTTPS for remote transfers" in str(exc.value)
 
 
 def test_large_attachment_revision_hashes_in_bounded_memory(vault_factory, tmp_path):

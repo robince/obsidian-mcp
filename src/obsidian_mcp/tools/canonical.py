@@ -477,7 +477,8 @@ def read_attachment(path: str) -> dict:
             route += "?" + urlencode({"vault": cfg.resolve_vault_name()})
         raise Problem(
             "too_large",
-            f"{exc}. On HTTP deployments, use authenticated GET {route} with the same vault access.",
+            f"{exc}. On HTTP deployments, use authenticated GET {route} with the same vault access. "
+            "Use HTTPS for remote transfers; keep credentials in the client.",
         ) from exc
     return {
         "path": path,

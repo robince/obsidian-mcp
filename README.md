@@ -190,6 +190,12 @@ docker compose up -d
 
 The `docker-compose.yml` pulls the pre-built image from GHCR — no cloning or building required. To build locally instead, swap `image:` for `build: .` in the compose file.
 
+The HTTP port is published only on `127.0.0.1:8000`. For remote access, use
+a TLS-terminating proxy on the host, or the private tunnel profile below.
+Require HTTPS at the public listener and keep the HTTP origin inaccessible
+from untrusted networks. Clients must connect directly with HTTPS: redirecting
+a request after it includes a bearer token cannot protect that token.
+
 GitHub OAuth state is stored under `/data/fastmcp` by default, inside the
 Compose `mcp-data` volume, so logins survive container restarts.
 
@@ -402,7 +408,8 @@ identity's default vault, or pass `?vault=<name>` in the URL to pick a
 different one of its allowed vaults (same rule as the `vault=` tool
 argument). Transfers require bearer authentication (API key or OAuth); legacy
 scoped signed URLs are no longer accepted. Keep credentials in the client, outside
-the model conversation.
+the model conversation. Remote transfers must use HTTPS through the TLS-terminating
+proxy. Attachment downloads return `Cache-Control: no-store`.
 
 
 > **Known limitation:** `/health` doesn't go through per-request auth/vault

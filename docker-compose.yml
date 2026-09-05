@@ -58,7 +58,8 @@ services:
       # - /path/to/private-vault:/vaults/private
       # - /path/to/monari-vault:/vaults/monari
     ports:
-      - "8000:8000"
+      # Only a local TLS-terminating proxy should expose this service remotely.
+      - "127.0.0.1:8000:8000"
 
 volumes:
   mcp-data:

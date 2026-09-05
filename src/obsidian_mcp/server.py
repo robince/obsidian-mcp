@@ -498,12 +498,14 @@ async def attachment_route(request: Request) -> Response:
     disk instead. Accepts the server's static bearer token, a valid GitHub
     OAuth access token (if configured). The authenticated client performs the
     transfer directly; credentials do not need to pass through the model.
+    Remote clients must use HTTPS at the TLS-terminating proxy; the HTTP
+    origin must remain on loopback or a private proxy network.
 
     Usage:
         curl -X PUT --data-binary @file.png \\
-            -H "Authorization: Bearer <API_KEY>" http://host:port/attachments/path/to/file.png
+            -H "Authorization: Bearer <API_KEY>" https://mcp.example.com/attachments/path/to/file.png
         curl -o file.png \\
-            -H "Authorization: Bearer <API_KEY>" http://host:port/attachments/path/to/file.png
+            -H "Authorization: Bearer <API_KEY>" https://mcp.example.com/attachments/path/to/file.png
 
     Multi-vault mode: this route doesn't go through VaultResolutionMiddleware
     (it's a plain Starlette route, not MCP tool-call dispatch), so vault
@@ -549,7 +551,11 @@ async def attachment_route(request: Request) -> Response:
             except FileNotFoundError:
                 return JSONResponse({"error": "Attachment not found"}, status_code=404)
             mime, _ = mimetypes.guess_type(path)
-            return Response(data, media_type=mime or "application/octet-stream")
+            return Response(
+                data,
+                media_type=mime or "application/octet-stream",
+                headers={"Cache-Control": "no-store"},
+            )
 
         content_length = request.headers.get("content-length")
         if content_length is not None:
