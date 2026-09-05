@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import resource
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -49,7 +50,7 @@ def main():
                         "continuation_seconds": continuation,
                         "legacy_scan_seconds": legacy,
                         "maxrss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                        "platform": os.sys.platform,
+                        "platform": sys.platform,
                     }
                 ),
                 flush=True,

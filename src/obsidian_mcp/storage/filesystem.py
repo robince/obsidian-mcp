@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import os
 import stat
 import uuid
@@ -182,9 +183,14 @@ def _revision_at(parent_fd: int, leaf: str) -> FileRevision | None:
         initial = os.fstat(fd)
         if not stat.S_ISREG(initial.st_mode):
             raise IsADirectoryError(f"Target is not a regular file: {leaf!r}")
-        content = _read_all(fd)
+        # Revision-only callers must not buffer large attachments in memory.
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
         info = os.fstat(fd)
-        return FileRevision.from_bytes(content, mtime_ns=info.st_mtime_ns)
+        return FileRevision(digest.hexdigest(), size, info.st_mtime_ns)
     finally:
         os.close(fd)
 

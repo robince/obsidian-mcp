@@ -14,6 +14,7 @@ import re
 from datetime import UTC, date, datetime
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
+from urllib.parse import quote, urlencode
 
 import yaml
 from markdown_it import MarkdownIt
@@ -450,7 +451,11 @@ def patch_frontmatter(
                 del fm[key]
         if not updated and not removed:
             return raw
-        rendered = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False).replace("\n", newline)
+        rendered = (
+            yaml.safe_dump(fm, allow_unicode=True, sort_keys=False).replace("\n", newline)
+            if fm
+            else ""
+        )
         return f"{bom}---{newline}{rendered}---{newline}{body}"
 
     result = mutate(path, transform, expectedRevision, "patch_frontmatter", index)
@@ -466,7 +471,14 @@ def read_attachment(path: str) -> dict:
             path, max_bytes=MAX_READ
         )
     except OverflowError as exc:
-        raise Problem("too_large", str(exc)) from exc
+        cfg = get_config()
+        route = "/attachments/" + quote(path, safe="/")
+        if cfg.multi_vault:
+            route += "?" + urlencode({"vault": cfg.resolve_vault_name()})
+        raise Problem(
+            "too_large",
+            f"{exc}. On HTTP deployments, use authenticated GET {route} with the same vault access.",
+        ) from exc
     return {
         "path": path,
         "revision": revision.token,

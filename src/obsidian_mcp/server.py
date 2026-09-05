@@ -316,8 +316,9 @@ class VaultResolutionMiddleware(Middleware):
         tool_name = getattr(context.message, "name", None)
         if tool_name in _canonical_arguments:
             supplied = set(getattr(context.message, "arguments", None) or {})
-            if supplied - _canonical_arguments[tool_name]:
-                return canonical_server.result({"error": {"code": "invalid_input", "message": "Unknown tool argument"}}, is_error=True)
+            unknown = sorted(supplied - _canonical_arguments[tool_name])
+            if unknown:
+                return canonical_server.result({"error": {"code": "invalid_input", "message": f"Unknown tool arguments: {', '.join(unknown)}"}}, is_error=True)
         cfg = get_config()
         if not cfg.multi_vault:
             return await call_next(context)

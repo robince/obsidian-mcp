@@ -76,6 +76,9 @@ async def test_tools_raw_workflow_and_errors(vault_factory, monkeypatch):
             "read_file", {"path": "n.md", "unexpected": True}, raise_on_error=False
         )
         assert invalid.is_error and invalid.structured_content["error"]["code"] == "invalid_input"
+        assert (
+            invalid.structured_content["error"]["message"] == "Unknown tool arguments: unexpected"
+        )
         batch = await client.call_tool(
             "read_files", {"files": [{"path": "n.md"}, {"path": "missing.md"}]}
         )
@@ -84,10 +87,10 @@ async def test_tools_raw_workflow_and_errors(vault_factory, monkeypatch):
             "edit_file", {"path": "n.md", "content": "x"}, raise_on_error=False
         )
         assert missing.is_error
-        readonly = await client.call_tool(
+        bad_limit = await client.call_tool(
             "search_files", {"query": "x", "limit": 0}, raise_on_error=False
         )
-        assert readonly.is_error
+        assert bad_limit.is_error
 
 
 def test_conventions_are_not_embedded(vault_factory):
@@ -97,9 +100,14 @@ def test_conventions_are_not_embedded(vault_factory):
 
 @pytest.mark.asyncio
 async def test_old_profile_setting_does_not_restore_legacy(monkeypatch):
-    monkeypatch.setenv("TOOL_PROFILE", "full")
-    module = importlib.reload(server)
-    assert {tool.name for tool in await module.mcp.list_tools()} == NAMES
+    try:
+        with monkeypatch.context() as environment:
+            environment.setenv("TOOL_PROFILE", "full")
+            module = importlib.reload(server)
+            assert {tool.name for tool in await module.mcp.list_tools()} == NAMES
+    finally:
+        # Restore the original environment before rebuilding module state.
+        importlib.reload(server)
 
 
 @pytest.mark.asyncio
@@ -155,6 +163,15 @@ async def test_multi_vault_batch_and_cursor_isolation(tmp_path, monkeypatch):
     async with Client(server.mcp) as client:
         listed = await client.call_tool("list_vaults", {})
         assert {v["name"] for v in listed.structured_content["vaults"]} == {"a", "b"}
+        (tmp_path / "b" / "large file.pdf").write_bytes(b"x" * (c.MAX_READ + 1))
+        oversized = await client.call_tool(
+            "read_attachment", {"vault": "b", "path": "large file.pdf"}, raise_on_error=False
+        )
+        assert oversized.structured_content["error"]["code"] == "too_large"
+        assert (
+            "/attachments/large%20file.pdf?vault=b"
+            in oversized.structured_content["error"]["message"]
+        )
         first = await client.call_tool("list_files", {"vault": "a", "limit": 1})
         cursor = first.structured_content["cursor"]
         mismatch = await client.call_tool(

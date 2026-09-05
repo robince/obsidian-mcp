@@ -13,7 +13,7 @@ import pytest
 from fastmcp.server.auth import AccessToken, TokenVerifier
 
 from obsidian_mcp import server
-from obsidian_mcp.tools.attachments import create_attachment_token
+from obsidian_mcp.tools.attachments import create_attachment_token, verify_attachment_token
 
 
 def _client():
@@ -497,3 +497,10 @@ async def test_scoped_token_route_multi_vault_isolates_correctly(tmp_path, monke
     assert (vault_b / "file.png").read_bytes() == b"data"
     assert resp_tampered.status_code == 401
     assert not (vault_a / "file.png").exists()
+
+
+def test_scoped_token_rejects_wrong_signing_key(vault_factory):
+    vault_factory({})
+    token = create_attachment_token("file.png", signing_key="correct", vault="default", method="GET")
+    assert verify_attachment_token("correct", "GET", "file.png", "default", token["expires_at"], token["sig"])
+    assert not verify_attachment_token("wrong", "GET", "file.png", "default", token["expires_at"], token["sig"])

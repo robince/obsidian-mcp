@@ -202,10 +202,13 @@ async def test_scripted_mcp_calls_return_revision_and_error_conflict(tmp_path, m
     async with Client(server.mcp) as client:
         read_result = await client.call_tool("read_file", {"path": "note.md"})
         revision = read_result.data["revision"]
-        await client.call_tool(
+        applied = await client.call_tool(
             "append_file",
             {"path": "note.md", "content": "second", "expectedRevision": revision},
         )
+        assert applied.is_error is False
+        assert applied.structured_content["revision"] != revision
+        assert (tmp_path / "note.md").read_text() == "firstsecond"
         conflict = await client.call_tool(
             "append_file",
             {"path": "note.md", "content": "second", "expectedRevision": revision},

@@ -292,3 +292,51 @@ def test_unrelated_yaml_properties_and_noop_preserve_exact_text(writable):
     c.patch_frontmatter("crlf.md", {"x": 2})
     assert c.read_file("crlf.md")["content"].endswith("---\r\n\r\nBody  \r\n")
     assert c.read_frontmatter("crlf.md")["frontmatter"]["y"] == ["a", "b"]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_remove_final_frontmatter_key_leaves_empty_block(writable, newline):
+    writable({})
+    body = f"{newline}Body  {newline}"
+    c.create_file("note.md", f"---{newline}last: value{newline}---{newline}{body}")
+    result = c.patch_frontmatter("note.md", {}, ["last"])
+    assert result["removed"] == ["last"]
+    assert c.read_file("note.md")["content"] == f"---{newline}---{newline}{body}"
+    assert c.read_frontmatter("note.md")["frontmatter"] == {}
+
+
+def test_attachment_error_offers_encoded_http_recovery(vault_factory, tmp_path):
+    vault_factory({})
+    path = "a #?.pdf"
+    (tmp_path / path).write_bytes(b"x" * (c.MAX_READ + 1))
+    with pytest.raises(c.Problem) as exc:
+        c.read_attachment(path)
+    assert exc.value.code == "too_large"
+    assert "512000" in str(exc.value)
+    assert "authenticated GET /attachments/a%20%23%3F.pdf" in str(exc.value)
+
+
+def test_listing_large_attachment_hashes_in_bounded_memory(vault_factory, tmp_path):
+    import hashlib
+    import tracemalloc
+
+    vault_factory({})
+    chunk = b"x" * (1024 * 1024)
+    digest = hashlib.sha256()
+    path = tmp_path / "large.mp4"
+    with path.open("wb") as stream:
+        for _ in range(12):
+            stream.write(chunk)
+            digest.update(chunk)
+        stream.write(b"end")
+        digest.update(b"end")
+    tracemalloc.start()
+    try:
+        item = c.list_page(attachment=True)["attachments"][0]
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert item["revision"] == "sha256:" + digest.hexdigest()
+    assert item["sizeBytes"] == 12 * len(chunk) + 3
+    assert item["modifiedAt"] == path.stat().st_mtime_ns // 1_000_000
+    assert peak < 4 * 1024 * 1024

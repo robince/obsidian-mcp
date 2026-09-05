@@ -51,7 +51,18 @@ def _require_rejection(result: Any, description: str) -> str:
 async def run(args: argparse.Namespace) -> None:
     async with Client(args.url, auth=args.api_key) as client:
         tools = {tool.name for tool in await client.list_tools()}
-        required = {"list_files", "read_file", "create_file"}
+        required = {
+            "list_files",
+            "read_file",
+            "create_file",
+            "get_file_outline",
+            "read_files",
+            "append_file",
+            "patch_file",
+            "patch_frontmatter",
+            "search_files",
+            "edit_file",
+        }
         missing = required - tools
         if missing:
             raise RuntimeError(f"Missing required tools: {sorted(missing)}")
