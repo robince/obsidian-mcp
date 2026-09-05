@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import base64
-import time
 
 import pytest
 
 from obsidian_mcp.tools.attachments import (
     AttachmentTooLargeError,
-    _sign_attachment_token,
     add_attachment,
-    create_attachment_token,
     list_attachments,
     read_attachment,
-    verify_attachment_token,
 )
 
 # ── list_attachments ──────────────────────────────────────────────────────
@@ -90,134 +86,3 @@ def test_add_attachment_enforces_configured_size_limit(vault_factory, monkeypatc
     vault_factory({})
     with pytest.raises(AttachmentTooLargeError):
         add_attachment("file.png", base64.b64encode(b"1234").decode())
-
-
-# ── attachment tokens ─────────────────────────────────────────────────────
-# create_attachment_token/verify_attachment_token take signing_key/vault
-# explicitly now — which key is valid to sign with, and which vault a token
-# is for, is decided by the caller (server.py's create_attachment_token_tool,
-# based on the calling identity), not by this module. See
-# tests/test_server_attachment_route.py for the "is a key even configured"
-# / multi-vault-identity-resolution behavior that used to live here.
-
-def test_create_attachment_token_round_trip(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default", method="PUT", expires_in=60)
-    assert token["path"] == "file.png"
-    assert token["method"] == "PUT"
-    assert token["vault"] == "default"
-    assert verify_attachment_token("secret", "PUT", "file.png", "default", token["expires_at"], token["sig"])
-
-
-def test_create_attachment_token_no_url_without_public_base_url(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default")
-    assert "url" not in token
-
-
-def test_create_attachment_token_includes_url_when_configured(vault_factory, monkeypatch):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://obsidian.example.com")
-    vault_factory({})
-    token = create_attachment_token(
-        "docs/file.pdf", signing_key="secret", vault="default", method="PUT", expires_in=60
-    )
-    expected = (
-        f"https://obsidian.example.com/attachments/docs/file.pdf"
-        f"?exp={token['expires_at']}&sig={token['sig']}"
-    )
-    assert token["url"] == expected
-
-
-def test_create_attachment_token_url_includes_non_default_vault(vault_factory, monkeypatch):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://obsidian.example.com")
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="monari")
-    assert "vault=monari" in token["url"]
-
-
-def test_create_attachment_token_url_strips_trailing_slash(vault_factory, monkeypatch):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://obsidian.example.com/")
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default")
-    assert token["url"].startswith("https://obsidian.example.com/attachments/file.png?")
-
-
-def test_create_attachment_token_url_encodes_path(vault_factory, monkeypatch):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://obsidian.example.com")
-    vault_factory({})
-    token = create_attachment_token("My Photos/image one.png", signing_key="secret", vault="default")
-    assert "My%20Photos/image%20one.png" in token["url"]
-
-
-def test_verify_attachment_token_rejects_wrong_key(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default")
-    assert not verify_attachment_token(
-        "wrong-key", "PUT", "file.png", "default", token["expires_at"], token["sig"]
-    )
-
-
-def test_verify_attachment_token_rejects_wrong_path(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default")
-    assert not verify_attachment_token(
-        "secret", "PUT", "other.png", "default", token["expires_at"], token["sig"]
-    )
-
-
-def test_verify_attachment_token_rejects_wrong_method(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default", method="PUT")
-    assert not verify_attachment_token(
-        "secret", "GET", "file.png", "default", token["expires_at"], token["sig"]
-    )
-
-
-def test_verify_attachment_token_rejects_wrong_vault(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="private")
-    assert not verify_attachment_token(
-        "secret", "PUT", "file.png", "monari", token["expires_at"], token["sig"]
-    )
-
-
-def test_attachment_token_payload_has_no_path_vault_delimiter_collision():
-    expires_at = 1_800_000_000
-    first = _sign_attachment_token(
-        "secret", "GET", "report.pdf:team", "private", expires_at
-    )
-    second = _sign_attachment_token(
-        "secret", "GET", "report.pdf", "team:private", expires_at
-    )
-
-    assert first != second
-
-
-def test_verify_attachment_token_rejects_expired(vault_factory):
-    vault_factory({})
-    expired_at = int(time.time()) - 10
-    sig = _sign_attachment_token("secret", "PUT", "file.png", "default", expired_at)
-    assert not verify_attachment_token("secret", "PUT", "file.png", "default", expired_at, sig)
-
-
-def test_create_attachment_token_rejects_bad_method(vault_factory):
-    vault_factory({})
-    with pytest.raises(ValueError, match="method"):
-        create_attachment_token("file.png", signing_key="secret", vault="default", method="DELETE")
-
-
-def test_create_attachment_token_caps_ttl(vault_factory):
-    vault_factory({})
-    token = create_attachment_token("file.png", signing_key="secret", vault="default", expires_in=999999)
-    assert token["expires_at"] <= int(time.time()) + 3600 + 1
-
-
-@pytest.mark.parametrize(
-    "path",
-    [".env", ".hidden/file.png", "extensionless", "script.py", "script.sh", "config.yaml"],
-)
-def test_put_attachment_token_positive_policy_rejects_unsafe_names(path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "secret")
-    vault_factory({})
-    with pytest.raises(ValueError):
-        create_attachment_token(path, signing_key="secret", vault="default", method="PUT")

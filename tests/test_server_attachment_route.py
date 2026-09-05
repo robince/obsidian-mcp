@@ -13,7 +13,6 @@ import pytest
 from fastmcp.server.auth import AccessToken, TokenVerifier
 
 from obsidian_mcp import server
-from obsidian_mcp.tools.attachments import create_attachment_token, verify_attachment_token
 
 
 def _client():
@@ -239,95 +238,26 @@ async def test_upload_route_accepts_api_key_alongside_oauth(tmp_path, vault_fact
     assert resp.status_code == 200
 
 
-# ── scoped tokens (no master key exposed) ────────────────────────────────────
-
 @pytest.mark.asyncio
-async def test_scoped_token_authorizes_upload(tmp_path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "master-key")
-    vault_factory({})
-    token = create_attachment_token(
-        "docs/file.pdf", signing_key="master-key", vault="default", method="PUT", expires_in=60
-    )
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+async def test_old_signed_urls_require_bearer_auth(method, tmp_path, vault_factory, monkeypatch):
+    import hashlib
+    import hmac
+    import json
 
+    vault_factory({})
+    monkeypatch.setenv("API_KEY", "master-key")
+    path = tmp_path / "file.png"
+    path.write_bytes(b"original")
+    expiry = int(time.time()) + 60
+    message = json.dumps([method, "file.png", "default", expiry], separators=(",", ":"))
+    signature = hmac.new(b"master-key", message.encode(), hashlib.sha256).hexdigest()
     async with _client() as client:
-        resp = await client.put(
-            f"/attachments/docs/file.pdf?exp={token['expires_at']}&sig={token['sig']}",
-            content=b"PDF-CONTENT",
+        response = await client.request(
+            method, f"/attachments/file.png?exp={expiry}&sig={signature}", content=b"changed"
         )
-
-    assert resp.status_code == 200
-    assert (tmp_path / "docs" / "file.pdf").read_bytes() == b"PDF-CONTENT"
-
-
-@pytest.mark.asyncio
-async def test_scoped_token_authorizes_download(tmp_path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "master-key")
-    vault_factory({})
-    (tmp_path / "file.png").write_bytes(b"image-bytes")
-    token = create_attachment_token(
-        "file.png", signing_key="master-key", vault="default", method="GET", expires_in=60
-    )
-
-    async with _client() as client:
-        resp = await client.get(f"/attachments/file.png?exp={token['expires_at']}&sig={token['sig']}")
-
-    assert resp.status_code == 200
-    assert resp.content == b"image-bytes"
-
-
-@pytest.mark.asyncio
-async def test_scoped_token_rejected_for_wrong_path(tmp_path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "master-key")
-    vault_factory({})
-    token = create_attachment_token(
-        "allowed.png", signing_key="master-key", vault="default", method="PUT", expires_in=60
-    )
-
-    async with _client() as client:
-        resp = await client.put(
-            f"/attachments/other.png?exp={token['expires_at']}&sig={token['sig']}",
-            content=b"data",
-        )
-
-    assert resp.status_code == 401
-    assert not (tmp_path / "other.png").exists()
-
-
-@pytest.mark.asyncio
-async def test_scoped_token_rejected_for_wrong_method(tmp_path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "master-key")
-    vault_factory({})
-    # token minted for GET must not authorize a PUT (would let a read-only
-    # token overwrite the file it was meant only to expose for reading)
-    token = create_attachment_token(
-        "file.png", signing_key="master-key", vault="default", method="GET", expires_in=60
-    )
-
-    async with _client() as client:
-        resp = await client.put(
-            f"/attachments/file.png?exp={token['expires_at']}&sig={token['sig']}",
-            content=b"data",
-        )
-
-    assert resp.status_code == 401
-    assert not (tmp_path / "file.png").exists()
-
-
-@pytest.mark.asyncio
-async def test_scoped_token_rejected_when_expired(tmp_path, vault_factory, monkeypatch):
-    monkeypatch.setenv("API_KEY", "master-key")
-    vault_factory({})
-    token = create_attachment_token(
-        "file.png", signing_key="master-key", vault="default", method="PUT", expires_in=1
-    )
-
-    async with _client() as client:
-        resp = await client.put(
-            f"/attachments/file.png?exp={int(time.time()) - 10}&sig={token['sig']}",
-            content=b"data",
-        )
-
-    assert resp.status_code == 401
+    assert response.status_code == 401
+    assert path.read_bytes() == b"original"
 
 
 # ── multi-vault mode ─────────────────────────────────────────────────────
@@ -473,70 +403,28 @@ async def test_bearer_token_route_enforces_selected_vault_write_policy(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_scoped_token_route_multi_vault_isolates_correctly(tmp_path, monkeypatch):
+async def test_downloads_are_not_cacheable_across_identity_changes(tmp_path, monkeypatch):
+    import json
+
+    import obsidian_mcp.config as cfg_mod
+
     config_path, vault_a, vault_b = _write_vaults_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["identities"][1]["default"] = "monari"
+    config_path.write_text(json.dumps(config))
+    (vault_a / "file.png").write_bytes(b"private")
+    (vault_b / "file.png").write_bytes(b"monari")
     _enable_multi_vault_http(monkeypatch, config_path)
-    import obsidian_mcp.config as cfg_mod
     cfg_mod._config = None
+    monkeypatch.setattr(server.mcp, "auth", server._build_auth())
 
-    token = create_attachment_token("file.png", signing_key="sk-both", vault="monari", method="PUT", expires_in=60)
-
+    # Reuse one client and URL while changing the authenticated identity.
+    # This verifies the server's cache directive, not browser cache internals.
     async with _client() as client:
-        # Correct vault query param -> succeeds, writes to the right vault.
-        resp_ok = await client.put(
-            f"/attachments/file.png?exp={token['expires_at']}&sig={token['sig']}&vault=monari",
-            content=b"data",
-        )
-        # Tampering with the vault query param invalidates the signature.
-        resp_tampered = await client.put(
-            f"/attachments/file.png?exp={token['expires_at']}&sig={token['sig']}&vault=private",
-            content=b"tampered",
-        )
-
-    assert resp_ok.status_code == 200
-    assert (vault_b / "file.png").read_bytes() == b"data"
-    assert resp_tampered.status_code == 401
-    assert not (vault_a / "file.png").exists()
-
-
-def test_create_attachment_token_tool_rejects_github_login_identity(tmp_path, monkeypatch):
-    config_path, _vault_a, _vault_b = _write_vaults_config(tmp_path)
-    monkeypatch.setenv("VAULTS_CONFIG", str(config_path))
-    monkeypatch.setenv("TRANSPORT", "sse")
-    import obsidian_mcp.config as cfg_mod
-    cfg_mod._config = None
-    monkeypatch.setattr(
-        server, "get_access_token",
-        lambda: AccessToken(token="x", client_id="oauth", scopes=[], claims={"login": "octocat"}),
-    )
-
-    with pytest.raises(PermissionError, match="api_key identity"):
-        server.create_attachment_token_tool("file.png")
-
-
-def test_create_attachment_token_tool_multi_vault_signs_with_identity_key(tmp_path, monkeypatch):
-    config_path, _vault_a, vault_b = _write_vaults_config(tmp_path)
-    monkeypatch.setenv("VAULTS_CONFIG", str(config_path))
-    monkeypatch.setenv("TRANSPORT", "sse")
-    import obsidian_mcp.config as cfg_mod
-    cfg_mod._config = None
-    monkeypatch.setattr(
-        server, "get_access_token",
-        lambda: AccessToken(token="sk-both", client_id="sk-both", scopes=[]),
-    )
-
-    # Calling create_attachment_token_tool directly (not through FastMCP's
-    # tool dispatch) bypasses VaultResolutionMiddleware — set the vault
-    # context by hand to simulate what it would have done for vault="monari".
-    context_token = cfg_mod.set_current_vault("monari")
-    try:
-        token = server.create_attachment_token_tool("file.png", vault="monari")
-    finally:
-        cfg_mod.reset_current_vault(context_token)
-    assert token["vault"] == "monari"
-    assert not verify_attachment_token(
-        "wrong-key", "PUT", "file.png", "monari", token["expires_at"], token["sig"]
-    )
-    assert verify_attachment_token(
-        "sk-both", "PUT", "file.png", "monari", token["expires_at"], token["sig"]
-    )
+        for key, expected in [("sk-private-only", b"private"), ("sk-both", b"monari")]:
+            response = await client.get(
+                "/attachments/file.png", headers={"Authorization": f"Bearer {key}"}
+            )
+            assert response.status_code == 200
+            assert response.content == expected
+            assert response.headers["cache-control"] == "no-store"
