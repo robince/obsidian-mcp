@@ -6,7 +6,7 @@ The implementation follows the final user decision: a clean break with a single
 
 ## Automated and HTTP checks
 
-- Complete Python suite: 655 passing tests, covering existing storage/auth/index
+- Complete Python suite: 637 passing tests, covering existing storage/auth/index
   protection and the new API, raw content, writes, search, pagination and batching.
 - Ruff checks pass for source, tests and the smoke/benchmark scripts.
 - Authenticated localhost HTTP smoke test passes against a disposable vault:
@@ -59,11 +59,19 @@ index/cache is justified by these measurements alone.
 ## PR #10 review follow-up
 
 Revision-only storage checks now hash in 1 MiB chunks instead of buffering entire
-files. A 12 MiB attachment-listing regression verifies the same digest, size and
+files. A 12 MiB attachment revision regression verifies the same digest, size and
 mtime with less than 4 MiB of traced allocation. All atomic-write revision checks
 use the same streaming path.
 
 Additional regressions cover removing the final YAML key without a literal `{}`
 block, encoded authenticated HTTP recovery paths (including multi-vault selection)
-for oversized attachments, unknown-argument diagnostics and wrong signing keys.
+for oversized attachments, unknown-argument diagnostics and rejection of legacy signed URLs.
 Smoke preflight checks every tool it invokes; test reloads restore module state.
+
+
+Listings now use enumeration metadata without reading file content and omit content
+revisions. Regression checks cover both Markdown and binary listings, canonical
+paths across read tools, one storage construction per read_file, and unchanged
+frontmatter tag projections alongside normalized tag filtering. The unused scoped
+attachment-token authentication branch and mint/verify helpers have been removed;
+HTTP transfers use the existing bearer API-key/OAuth authorization.

@@ -63,7 +63,8 @@ Ranges still require the whole file to fit the read limit. Batch combined wire
 budget: 1 MiB. Overall combined JSON text + structured result budget: 8 MiB.
 Attachment reads always return `contentBase64`, `revision`, `mimeType`, `sizeBytes`.
 `add_attachment` is create-only and retains MAX_ATTACHMENT_BYTES and extension
-policy. Existing HTTP attachment transfer authorization is unchanged.
+policy. HTTP attachment transfers require bearer authentication (API key or OAuth);
+legacy scoped signed URLs and their token helpers are removed.
 
 ## Search and pagination
 
@@ -73,9 +74,10 @@ Prefix ending `/` selects descendants; other prefixes match literal path starts.
 Prefixes need not name directories. Filesystem path matching is case-sensitive.
 
 Listing defaults to 50 entries, maximum 100, returning `{files, cursor?}` or
-`{attachments, cursor?}`. Entries include path, opaque content revision, sizeBytes,
+`{attachments, cursor?}`. Entries include path, sizeBytes,
 modifiedAt in Unix milliseconds; attachments add mimeType. No synthetic creation
-time is returned. Attachment discovery retains the filesystem extension allowlist.
+time is returned. Listings do not read or hash content; obtain content revisions
+from read tools. Attachment discovery retains the filesystem extension allowlist.
 
 Search requires text or nonempty typed filters. Whitespace-separated literal
 terms combine with AND, case-insensitively, across raw content and path. Ranking
@@ -96,7 +98,9 @@ Filter operators are `eq`, `ne`, `contains`, `exists`, `lt`, `lte`, `gt`, `gte`.
 Ordering requires `type: "number"` or `type: "date"`. Dates must be ISO calendar
 dates or timezone-qualified timestamps. Missing differs from null; numeric values
 differ from booleans and strings; contains means list membership. Tags are
-normalized frontmatter tags only. Selected absent properties are omitted.
+normalized from frontmatter for filtering only. Selected properties preserve their
+JSON-compatible frontmatter values, including the original tags string or list.
+Selected absent properties are omitted.
 
 Search defaults to 20 results, maximum 50. Query limits are 16 terms / 256 UTF-8
 bytes; filters max 16, selected properties max 20. Snippets max 1024 bytes; combined

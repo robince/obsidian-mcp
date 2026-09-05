@@ -41,7 +41,6 @@ from .storage.watcher import VaultWatcher
 from .tools.attachments import (
     AttachmentTooLargeError,
     validate_attachment_path,
-    verify_attachment_token,
     write_attachment_bytes,
 )
 from .tools.bases import list_bases, patch_base, read_base, write_base
@@ -462,34 +461,6 @@ async def _check_bearer_token(request: Request, cfg) -> AccessToken | None:
     return None
 
 
-def _check_scoped_token(request: Request, cfg, method: str, path: str) -> str | None:
-    """Returns the vault name a valid scoped token (?exp=&sig=[&vault=])
-    grants access to for this exact path+method, or None if missing/
-    invalid/expired. Tries every api_key identity's own value as the HMAC
-    signing key in multi-vault mode (there's no bearer header here to say
-    up front which identity minted it), or the single global API_KEY in
-    single-vault mode. A key matching the signature but not actually
-    allowed the requested vault is treated the same as no match."""
-    exp = request.query_params.get("exp")
-    sig = request.query_params.get("sig")
-    if not exp or not sig:
-        return None
-    vault_param = request.query_params.get("vault", cfg.default_vault_name)
-
-    if cfg.multi_vault:
-        candidates = [(identity.value, identity) for identity in cfg.identities if identity.type == "api_key"]
-    else:
-        candidates = [(cfg.api_key, None)] if cfg.api_key else []
-
-    for signing_key, identity in candidates:
-        if not verify_attachment_token(signing_key, method, path, vault_param, exp, sig):
-            continue
-        if identity is not None and vault_param not in identity.vaults:
-            continue
-        return vault_param
-    return None
-
-
 @mcp.custom_route("/health", methods=["GET"])
 async def health_route(request: Request) -> Response:
     """Unauthenticated liveness/readiness check for Docker HEALTHCHECK,
@@ -525,9 +496,8 @@ async def attachment_route(request: Request) -> Response:
     client/model is driving the MCP session — expensive and risky for large
     or many files. This route lets a client PUT/GET raw bytes straight to/from
     disk instead. Accepts the server's static bearer token, a valid GitHub
-    OAuth access token (if configured), or a short-lived scoped token from
-    the internal token helper (?exp=&sig=), so callers never need to be
-    handed the long-lived master key.
+    OAuth access token (if configured). The authenticated client performs the
+    transfer directly; credentials do not need to pass through the model.
 
     Usage:
         curl -X PUT --data-binary @file.png \\
@@ -539,9 +509,7 @@ async def attachment_route(request: Request) -> Response:
     (it's a plain Starlette route, not MCP tool-call dispatch), so vault
     resolution is done by hand here — a bearer token resolves to its
     identity's default vault (override with ?vault=<name>, same rule as the
-    vault= tool argument: must be one of that identity's allowed vaults); a
-    scoped token from the internal token helper carries its vault baked
-    into the signature already.
+    vault= tool argument: must be one of that identity's allowed vaults).
     """
     cfg = get_config()
     path = request.path_params["path"]
@@ -561,8 +529,6 @@ async def attachment_route(request: Request) -> Response:
                 return JSONResponse({"error": str(exc)}, status_code=403)
         else:
             vault_name = cfg.default_vault_name
-    else:
-        vault_name = _check_scoped_token(request, cfg, method, path)
 
     if vault_name is None:
         return JSONResponse({"error": "unauthorized"}, status_code=401)

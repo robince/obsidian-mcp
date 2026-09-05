@@ -400,8 +400,9 @@ re-selected on every call, same as any other argument.
 multi-vault-aware: a plain `Authorization: Bearer` request resolves to that
 identity's default vault, or pass `?vault=<name>` in the URL to pick a
 different one of its allowed vaults (same rule as the `vault=` tool
-argument). Existing signed transfer URLs remain valid; token minting is no longer
-an MCP tool.
+argument). Transfers require bearer authentication (API key or OAuth); legacy
+scoped signed URLs are no longer accepted. Keep credentials in the client, outside
+the model conversation.
 
 
 > **Known limitation:** `/health` doesn't go through per-request auth/vault

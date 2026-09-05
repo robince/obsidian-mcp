@@ -151,7 +151,7 @@ def note_path(path: str) -> str:
     return path
 
 
-def raw_read(path: str, expected: str | None = None) -> tuple[str, str]:
+def raw_read(path: str, expected: str | None = None) -> tuple[str, str, str]:
     storage = VaultStorage.from_config()
     path = storage.resolve_read(note_path(path)).relative
     try:
@@ -161,7 +161,7 @@ def raw_read(path: str, expected: str | None = None) -> tuple[str, str]:
     if expected is not None and revision.token != normalize_revision_token(expected):
         raise RevisionConflictError(path, expected, revision)
     try:
-        return data.decode("utf-8"), revision.token
+        return path, data.decode("utf-8"), revision.token
     except UnicodeError as exc:
         raise Problem("unsupported", "Markdown must contain valid UTF-8") from exc
 
@@ -176,9 +176,9 @@ def read_file(path: str, startLine=None, endLine=None, expectedRevision=None) ->
     request = ReadRequest(
         path=path, startLine=startLine, endLine=endLine, expectedRevision=expectedRevision
     )
-    raw, revision = raw_read(path, expectedRevision)
+    path, raw, revision = raw_read(path, expectedRevision)
     result = {
-        "path": VaultStorage.from_config().resolve_read(path).relative,
+        "path": path,
         "revision": revision,
         "content": raw,
     }
@@ -313,13 +313,13 @@ def frontmatter(raw: str) -> tuple[dict, str, str, str]:
 
 
 def read_frontmatter(path: str) -> dict:
-    raw, revision = raw_read(path)
+    path, raw, revision = raw_read(path)
     fm, _, _, _ = frontmatter(raw)
     return {"path": path, "revision": revision, "frontmatter": json_value(fm)}
 
 
 def get_file_outline(path: str) -> dict:
-    raw, revision = raw_read(path)
+    path, raw, revision = raw_read(path)
     lines = file_lines(raw)
     if len(lines) > 8192:
         raise Problem("too_large", "Outline exceeds 8192 lines; use ranged read_file")
@@ -379,7 +379,7 @@ def mutate(
                 path, bounded_text(content, MAX_WRITE), create_only=True
             )
         else:
-            raw, current = raw_read(path, expected)
+            path, raw, current = raw_read(path, expected)
             content = transform(raw)
             encoded = bounded_text(content, MAX_WRITE)
             revision = storage.write_bytes_atomic(path, encoded, expected_revision=current)
@@ -601,22 +601,17 @@ def list_page(prefix="", limit=50, cursor=None, *, attachment=False) -> dict:
     after = continuation["after"] if continuation else ""
     items = []
     more = False
-    storage = VaultStorage.from_config()
     for entry in candidates(prefix, attachment=attachment):
         if entry.relative <= after:
             continue
         if len(items) == limit:
             more = True
             break
-        try:
-            revision = storage.revision(entry.relative)
-        except FileNotFoundError:
-            continue
+        info = entry.stat_result
         item = {
             "path": entry.relative,
-            "revision": revision.token,
-            "sizeBytes": revision.size,
-            "modifiedAt": revision.mtime_ns // 1_000_000,
+            "sizeBytes": info.st_size,
+            "modifiedAt": info.st_mtime_ns // 1_000_000,
         }
         if attachment:
             item["mimeType"] = mimetypes.guess_type(entry.relative)[0] or "application/octet-stream"
@@ -655,8 +650,16 @@ def matches(fm: dict, condition: Filter) -> bool:
     if key not in fm:
         return False
     actual = fm[key]
-    if key == "tags" and isinstance(value, str):
-        value = value.removeprefix("#")
+    if key == "tags":
+        if isinstance(actual, (str, list)):
+            tags = re.split(r"[,\s]+", actual) if isinstance(actual, str) else actual
+            actual = [
+                tag.removeprefix("#")
+                for tag in tags
+                if isinstance(tag, str) and tag.removeprefix("#")
+            ]
+        if isinstance(value, str):
+            value = value.removeprefix("#")
     if op == "contains":
         return isinstance(actual, list) and any(scalar_equal(item, value) for item in actual)
     if op in {"eq", "ne"}:
@@ -724,7 +727,7 @@ def search_files(
     for entry in candidates(pathPrefix):
         path = entry.relative
         try:
-            raw, revision = raw_read(path)
+            path, raw, revision = raw_read(path)
             fingerprint.update(dumps([path, revision]).encode())
         except (OSError, Problem) as exc:
             if isinstance(exc, PermissionError):
@@ -736,14 +739,6 @@ def search_files(
         if filters or properties is not None:
             try:
                 fm = json_value(frontmatter(raw)[0])
-                tags = fm.get("tags")
-                if isinstance(tags, (str, list)):
-                    tags = re.split(r"[,\s]+", tags) if isinstance(tags, str) else tags
-                    fm["tags"] = [
-                        tag.removeprefix("#")
-                        for tag in tags
-                        if isinstance(tag, str) and tag.removeprefix("#")
-                    ]
             except Problem:
                 unqueryable += 1
                 continue

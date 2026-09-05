@@ -92,7 +92,7 @@ def register(mcp, index, list_vaults_impl) -> dict[str, set[str]]:
         cursor: c.CursorArg | None = None,
         vault: str | None = None,
     ) -> dict:
-        """List Markdown files recursively by prefix. Returns files and an optional continuation cursor; prefix ending / selects a subtree."""
+        """List Markdown files recursively by prefix. Returns path, sizeBytes, modifiedAt and an optional continuation cursor; prefix ending / selects a subtree. Read files to obtain content revisions."""
         return c.list_page(prefix, limit, cursor)
 
     @tool()
@@ -102,7 +102,7 @@ def register(mcp, index, list_vaults_impl) -> dict[str, set[str]]:
         cursor: c.CursorArg | None = None,
         vault: str | None = None,
     ) -> dict:
-        """List eligible non-Markdown attachments with metadata and optional cursor. Follow cursors for exhaustive results."""
+        """List eligible non-Markdown attachments with metadata and optional cursor. Follow cursors for exhaustive results. Read attachments to obtain content revisions."""
         return c.list_page(prefix, limit, cursor, attachment=True)
 
     @tool()

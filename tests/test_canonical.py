@@ -316,7 +316,7 @@ def test_attachment_error_offers_encoded_http_recovery(vault_factory, tmp_path):
     assert "authenticated GET /attachments/a%20%23%3F.pdf" in str(exc.value)
 
 
-def test_listing_large_attachment_hashes_in_bounded_memory(vault_factory, tmp_path):
+def test_large_attachment_revision_hashes_in_bounded_memory(vault_factory, tmp_path):
     import hashlib
     import tracemalloc
 
@@ -332,11 +332,62 @@ def test_listing_large_attachment_hashes_in_bounded_memory(vault_factory, tmp_pa
         digest.update(b"end")
     tracemalloc.start()
     try:
-        item = c.list_page(attachment=True)["attachments"][0]
+        revision = c.VaultStorage.from_config().revision("large.mp4")
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert item["revision"] == "sha256:" + digest.hexdigest()
-    assert item["sizeBytes"] == 12 * len(chunk) + 3
-    assert item["modifiedAt"] == path.stat().st_mtime_ns // 1_000_000
+    assert revision.token == "sha256:" + digest.hexdigest()
+    assert revision.size == 12 * len(chunk) + 3
+    assert revision.mtime_ns == path.stat().st_mtime_ns
     assert peak < 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize("attachment", [False, True])
+def test_listings_do_not_read_content(attachment, vault_factory, tmp_path, monkeypatch):
+    import os
+
+    vault_factory({})
+    path = tmp_path / ("large.pdf" if attachment else "large.md")
+    path.write_bytes(b"x" * (5 * 1024 * 1024))
+    info = path.stat()
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("Listing must not read file content")
+
+    monkeypatch.setattr(os, "read", unexpected_read)
+    monkeypatch.setattr(c.VaultStorage, "revision", unexpected_read)
+    result = c.list_page(attachment=attachment)
+    item = result["attachments" if attachment else "files"][0]
+    assert item["path"] == path.name
+    assert item["sizeBytes"] == info.st_size
+    assert item["modifiedAt"] == info.st_mtime_ns // 1_000_000
+    assert "revision" not in item
+    if attachment:
+        assert item["mimeType"] == "application/pdf"
+
+
+@pytest.mark.parametrize("reader", [c.read_file, c.read_frontmatter, c.get_file_outline])
+def test_readers_return_canonical_paths(reader, vault_factory):
+    vault_factory({"Notes/a.md": "---\ntags: [one]\n---\n# Heading\n"})
+    assert reader("Notes/./a.md")["path"] == "Notes/a.md"
+
+
+def test_read_file_constructs_storage_once(vault_factory, monkeypatch):
+    from unittest.mock import Mock
+
+    vault_factory({"a.md": "hello"})
+    factory = Mock(wraps=c.VaultStorage.from_config)
+    monkeypatch.setattr(c.VaultStorage, "from_config", factory)
+    assert c.read_file("a.md")["content"] == "hello"
+    factory.assert_called_once_with()
+
+
+@pytest.mark.parametrize("tags", ['"#a, #b"', '["#a", "b"]'])
+def test_search_projects_original_tags_while_normalizing_filters(tags, vault_factory):
+    vault_factory({"a.md": f"---\ntags: {tags}\n---\nHello"})
+    expected = c.read_frontmatter("a.md")["frontmatter"]["tags"]
+    result = c.search_files(
+        filters=[c.ValueFilter(property="tags", operator="contains", value="#a")],
+        properties=["tags"],
+    )
+    assert result["results"][0]["properties"]["tags"] == expected
